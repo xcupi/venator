@@ -230,18 +230,39 @@ def guess_severity(context: str, validated: bool) -> str:
 
 
 def classify_finding(context: str, validated: bool) -> str:
-    """Map (context, validated) -> classification label."""
+    """Map (context, validated) -> classification label.
+
+    Label semantics:
+      - ``validated``         — browser worker triggered a real alert() with a
+                                context-specific payload; XSS confirmed.
+      - ``potential``         — marker landed in a rendering sink (html /
+                                attribute / javascript). NOT confirmed XSS.
+      - ``safely_encoded``    — reflection observed but the target HTML-escapes
+                                the input; not exploitable via this vector.
+      - ``csrf_token_required`` — a required CSRF token could not be refreshed;
+                                probe was not sent (no bypass attempted).
+      - ``reflection_only``   — reflection was observed but the rendering
+                                context could not be determined (currently only
+                                emitted when the response body was truncated at
+                                ``SCANNER_MAX_BODY_BYTES`` before context could
+                                be classified). Kept out of ``potential``
+                                because exploitability is unknown; kept out of
+                                ``false_positive`` because the marker WAS seen.
+      - ``false_positive``    — marker was not observed in the response body,
+                                or the context is an unrecognised label.
+    """
     if validated:
         return "validated"
     if context == "csrf_required":
         return "csrf_token_required"
-    if context == "none":
-        return "false_positive"
-    if context == "encoded":
-        return "safely_encoded"
     if context in ("html", "attribute", "javascript"):
         return "potential"
-    return "reflection_only"
+    if context == "encoded":
+        return "safely_encoded"
+    if context == "unknown":
+        return "reflection_only"
+    # "none" or any unrecognised future context — no reflection observed.
+    return "false_positive"
 
 
 # ---------- Payload building ----------

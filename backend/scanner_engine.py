@@ -17,9 +17,10 @@ import logging
 import os
 import time
 import weakref
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List, Optional, Set, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import parse_qsl, urlsplit
 
 import aiohttp
 from sqlalchemy import update
@@ -334,9 +335,242 @@ async def _crawl(scan_id: str, allowed: list, excluded: list, target: str, cfg: 
                     db.commit()
 
 
+@dataclass
+class _ProbeOutcome:
+    """Structured result of running the marker + optional encoded probe for
+    ONE (url, param) pair. Populated identically by all three probe helpers so
+    _test_reflection can stay branch-free.
+
+    - status/body/truncated/req_dump: primary marker probe response and the
+      request-dump string recorded on the Finding.
+    - encoded_body/encoded_truncated: encoded-probe response used ONLY to
+      demote reflections in html/attribute context to 'encoded'. Set to
+      (None, False) when no encoded probe was applicable/sent.
+    - csrf_missing / csrf_refresh_failed: the CSRF-protected POST probe could
+      not obtain / refresh the required token; primary probe was NOT sent
+      (missing) or the encoded probe was NOT sent (refresh_failed). The caller
+      records a csrf_token_required finding and skips the URL/param.
+    """
+    status: int = 0
+    body: str = ""
+    truncated: bool = False
+    req_dump: str = ""
+    encoded_body: Optional[str] = None
+    encoded_truncated: bool = False
+    csrf_missing: bool = False
+    csrf_refresh_failed: bool = False
+
+
+def _should_probe_encoding(body: str, marker: str) -> bool:
+    """Encoded-probe gate: only send the encoded probe when the primary marker
+    landed in a rendering sink where HTML-escaping would matter (html or
+    attribute context). Matches the pre-refactor gate exactly."""
+    return bool(body) and classify_context(body, marker) in ("html", "attribute")
+
+
+async def _probe_get(
+    session: aiohttp.ClientSession, base_url: str, other: dict,
+    pname: str, inj: str, marker: str,
+    auth_headers: dict, auth_cookies: dict, allowed: list,
+    timeout: int, limiter: Optional["RequestLimiter"],
+) -> _ProbeOutcome:
+    """GET probe: primary marker + (optional) encoded probe on the shared session."""
+    q = {**other, pname: inj}
+    status, body, _, truncated = await _fetch(
+        session, "GET", base_url, params=q, timeout=timeout,
+        auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
+        limiter=limiter,
+    )
+    out = _ProbeOutcome(
+        status=status, body=body, truncated=truncated,
+        req_dump=f"GET {base_url}?{pname}={inj}",
+    )
+    if _should_probe_encoding(body, marker):
+        q2 = {**other, pname: ENCODED_PROBE}
+        _, eb, _, et = await _fetch(
+            session, "GET", base_url, params=q2, timeout=timeout,
+            auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
+            limiter=limiter,
+        )
+        out.encoded_body, out.encoded_truncated = eb, et
+    return out
+
+
+async def _probe_post_plain(
+    session: aiohttp.ClientSession, url: str, pname: str, inj: str,
+    hidden_fields: dict, marker: str,
+    auth_headers: dict, auth_cookies: dict, allowed: list,
+    timeout: int, limiter: Optional["RequestLimiter"],
+) -> _ProbeOutcome:
+    """POST probe (no CSRF fields): primary + optional encoded probe on the shared session."""
+    data = {**(hidden_fields or {}), pname: inj}
+    status, body, _, truncated = await _fetch(
+        session, "POST", url, data=data, timeout=timeout,
+        auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
+        limiter=limiter,
+    )
+    out = _ProbeOutcome(
+        status=status, body=body, truncated=truncated,
+        req_dump=f"POST {url}\n" + "\n".join(f"{k}={v}" for k, v in data.items()),
+    )
+    if _should_probe_encoding(body, marker):
+        _, eb, _, et = await _fetch(
+            session, "POST", url,
+            data={**(hidden_fields or {}), pname: ENCODED_PROBE}, timeout=timeout,
+            auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
+            limiter=limiter,
+        )
+        out.encoded_body, out.encoded_truncated = eb, et
+    return out
+
+
+async def _probe_post_csrf(
+    url: str, origin_url: str, pname: str, inj: str,
+    csrf_fields: list, hidden_fields: dict, marker: str,
+    auth_headers: dict, auth_cookies: dict, allowed: list,
+    timeout: int, limiter: Optional["RequestLimiter"],
+) -> _ProbeOutcome:
+    """CSRF-protected POST probe. Primary + encoded probe live inside the SAME
+    ``aiohttp.CookieJar``-backed session so any framework session cookie
+    (Flask/Django/Rails) set on the origin refetch is replayed on the follow-up
+    POST. Auth cookies (from the profile) are seeded into the jar and remain
+    scoped to the target host by aiohttp. If a required CSRF field cannot be
+    obtained/refreshed, the corresponding request is NOT sent — never bypass
+    CSRF."""
+    jar = aiohttp.CookieJar(unsafe=True)
+    async with aiohttp.ClientSession(
+        cookie_jar=jar,
+        cookies=auth_cookies or None,
+        headers={"User-Agent": "reflected-xss-hunter/1.0", **(auth_headers or {})},
+    ) as csrf_session:
+        _, origin_body, _, _ = await _fetch(
+            csrf_session, "GET", origin_url, timeout=timeout,
+            allowed_domains=allowed, limiter=limiter,
+        )
+        fresh_csrf = extract_csrf_values(origin_body, csrf_fields)
+        if not fresh_csrf or any(not fresh_csrf.get(n) for n in csrf_fields):
+            return _ProbeOutcome(csrf_missing=True)
+
+        data = {**(hidden_fields or {}), **fresh_csrf, pname: inj}
+        status, body, _, truncated = await _fetch(
+            csrf_session, "POST", url, data=data, timeout=timeout,
+            allowed_domains=allowed, limiter=limiter,
+        )
+        out = _ProbeOutcome(
+            status=status, body=body, truncated=truncated,
+            req_dump=f"POST {url}\n" + "\n".join(f"{k}={v}" for k, v in data.items()),
+        )
+
+        # Encoded reflection probe for CSRF-protected POSTs. Same jar-session
+        # so the authenticated framework session is preserved. Frameworks
+        # commonly rotate the token on every POST, so refresh the origin and
+        # require a full fresh token set before sending; if refresh fails we
+        # do NOT blind-submit.
+        if _should_probe_encoding(body, marker):
+            _, origin_body2, _, _ = await _fetch(
+                csrf_session, "GET", origin_url, timeout=timeout,
+                allowed_domains=allowed, limiter=limiter,
+            )
+            fresh_csrf2 = extract_csrf_values(origin_body2, csrf_fields)
+            if not fresh_csrf2 or any(not fresh_csrf2.get(n) for n in csrf_fields):
+                out.csrf_refresh_failed = True
+            else:
+                data2 = {**(hidden_fields or {}), **fresh_csrf2, pname: ENCODED_PROBE}
+                _, eb, _, et = await _fetch(
+                    csrf_session, "POST", url, data=data2, timeout=timeout,
+                    allowed_domains=allowed, limiter=limiter,
+                )
+                out.encoded_body, out.encoded_truncated = eb, et
+        return out
+
+
+def _record_csrf_required(scan_id: str, url: str, method: str, pname: str,
+                          csrf_fields: list, origin_url: str,
+                          csrf_missing: bool) -> None:
+    """Record a csrf_token_required finding (idempotent via _finding_exists).
+
+    Two reasons feed this: (a) origin refetch produced no CSRF value at all
+    (``csrf_missing=True``) — primary probe was never sent; (b) origin refetch
+    succeeded for the primary probe but the token rotation after the primary
+    could not be refreshed for the encoded probe (``csrf_missing=False``).
+    The evidence text reflects which case occurred, matching pre-refactor
+    behaviour."""
+    with SessionLocal() as db:
+        if _finding_exists(db, scan_id, url, method, pname, "csrf_required"):
+            return
+        reason = (
+            f"required CSRF field(s) {csrf_fields} could not be refreshed from {origin_url}"
+            if csrf_missing else
+            f"CSRF token refresh at {origin_url} failed before the encoded probe; "
+            f"reflection confirmed by primary probe but encoding state unknown"
+        )
+        db.add(Finding(
+            scan_id=scan_id, url=url, method=method, param=pname,
+            context="csrf_required",
+            classification=classify_finding("csrf_required", validated=False),
+            severity="low",
+            payload="",
+            evidence=reason,
+            request_dump=f"POST {url}\n(missing CSRF token: {csrf_fields})",
+            response_snippet="",
+        ))
+        db.commit()
+
+
+def _record_probe_result(scan_id: str, url: str, method: str, pname: str,
+                          context: str, reflected: bool, marker: str,
+                          body: str, req_dump: str) -> None:
+    """Persist Candidate + (optionally) Finding for one probe outcome.
+
+    Always increments ``params_tested`` and records a Candidate. Only creates
+    a Finding when the marker was observed (``reflected=True``) and no
+    prior finding for the same (scan, url, method, param, context) exists."""
+    with SessionLocal() as db:
+        db.add(Candidate(
+            scan_id=scan_id, url=url, method=method, param=pname,
+            context=context, reflected_raw=reflected, payload_marker=marker,
+        ))
+        s = db.query(Scan).filter(Scan.id == scan_id).first()
+        if s:
+            s.stats = {**(s.stats or {}), "params_tested": (s.stats or {}).get("params_tested", 0) + 1}
+        db.commit()
+
+        if reflected and not _finding_exists(db, scan_id, url, method, pname, context):
+            snippet_idx = body.find(marker) if marker in body else -1
+            snippet = body[max(0, snippet_idx - 80): snippet_idx + 160] if snippet_idx >= 0 else ""
+            db.add(Finding(
+                scan_id=scan_id, url=url, method=method, param=pname,
+                context=context,
+                classification=classify_finding(context, validated=False),
+                severity=guess_severity(context, validated=False),
+                payload="<probe>",
+                evidence=f"marker reflected in {context} context",
+                request_dump=req_dump,
+                response_snippet=snippet,
+            ))
+            if s:
+                s.stats = {**(s.stats or {}), "candidates": (s.stats or {}).get("candidates", 0) + 1}
+            db.commit()
+
+
 async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                            auth_headers: dict, auth_cookies: dict, login_indicators: list,
                            limiter: Optional[RequestLimiter] = None):
+    """Iterate every DiscoveredURL / param for a scan and probe for reflection.
+
+    Refactored into a linear pipeline:
+
+        plan -> probe -> classify -> record
+
+    where ``plan`` is one of {GET, POST_PLAIN, POST_CSRF} decided by the
+    stored DiscoveredURL metadata. Each ``_probe_*`` helper returns a
+    :class:`_ProbeOutcome`; the outer loop does not branch on method again.
+    All pre-refactor invariants are preserved: same jar-backed session for
+    CSRF primary + encoded probes, same encoded-probe gate
+    (``classify_context in (html, attribute)``), same truncation-aware
+    ``unknown`` context handling, same auth-loss detection, same finding
+    dedup semantics, same per-authority throttling.
+    """
     timeout = int(cfg.get("request_timeout", 15))
     marker = DEFAULT_MARKER
 
@@ -350,6 +584,7 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
 
     async with aiohttp.ClientSession(headers={"User-Agent": "reflected-xss-hunter/1.0"}) as session:
         for uid, url, method, params, origin_url, csrf_fields, hidden_fields in url_snapshot:
+            # Per-URL: honour STOPPING / PAUSED before touching the network.
             with SessionLocal() as db:
                 s = db.query(Scan).filter(Scan.id == scan_id).first()
                 if not s or s.status in ("STOPPING", "STOPPED"):
@@ -366,175 +601,76 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                 base_url = url.split("?", 1)[0] if method == "GET" else url
                 other = {}
                 if method == "GET" and "?" in url:
-                    from urllib.parse import parse_qsl
                     for k, v in parse_qsl(url.split("?", 1)[1], keep_blank_values=True):
                         if k != pname:
                             other[k] = v
 
-                # For POST forms with CSRF fields: refetch origin using a jar-backed session so
-                # any Flask/framework session cookie (e.g. flask_session) set on the refetch is
-                # automatically replayed on the POST. Auth cookies (from the profile) are seeded
-                # into the jar and remain scoped to the target host by aiohttp.
-                fresh_csrf = {}
-                csrf_missing = False
-                csrf_refresh_failed = False
-                body2 = None        # encoded-probe response (populated per path below)
-                truncated2 = False  # whether the encoded-probe response was cut
+                # Plan selection — exactly the pre-refactor branch conditions.
                 if method == "POST" and csrf_fields and origin_url:
-                    jar = aiohttp.CookieJar(unsafe=True)
-                    async with aiohttp.ClientSession(
-                        cookie_jar=jar,
-                        cookies=auth_cookies or None,
-                        headers={"User-Agent": "reflected-xss-hunter/1.0", **(auth_headers or {})},
-                    ) as csrf_session:
-                        _, origin_body, _, _ = await _fetch(
-                            csrf_session, "GET", origin_url, timeout=timeout,
-                            allowed_domains=allowed, limiter=limiter,
-                        )
-                        fresh_csrf = extract_csrf_values(origin_body, csrf_fields)
-                        if not fresh_csrf or any(not fresh_csrf.get(n) for n in csrf_fields):
-                            csrf_missing = True
-
-                        if not csrf_missing:
-                            data = {**(hidden_fields or {}), **fresh_csrf, pname: inj}
-                            status, body, _, truncated = await _fetch(
-                                csrf_session, "POST", url, data=data, timeout=timeout,
-                                allowed_domains=allowed, limiter=limiter,
-                            )
-                            req_dump = f"POST {url}\n" + "\n".join(f"{k}={v}" for k, v in data.items())
-
-                            # Encoded reflection probe for CSRF-protected POSTs. Runs inside
-                            # the SAME cookie-jar session as the primary probe so the
-                            # authenticated framework session is preserved. Frameworks commonly
-                            # rotate the token on every POST, so re-fetch the origin and
-                            # require a full fresh token set before sending the encoded probe;
-                            # if the refresh fails we do NOT blind-submit.
-                            # Gate matches the GET/non-CSRF paths: only probe when the primary
-                            # reflection landed in html/attribute context.
-                            if body and classify_context(body, marker) in ("html", "attribute"):
-                                _, origin_body2, _, _ = await _fetch(
-                                    csrf_session, "GET", origin_url, timeout=timeout,
-                                    allowed_domains=allowed, limiter=limiter,
-                                )
-                                fresh_csrf2 = extract_csrf_values(origin_body2, csrf_fields)
-                                if not fresh_csrf2 or any(not fresh_csrf2.get(n) for n in csrf_fields):
-                                    csrf_refresh_failed = True
-                                else:
-                                    data2 = {**(hidden_fields or {}), **fresh_csrf2, pname: ENCODED_PROBE}
-                                    _, body2, _, truncated2 = await _fetch(
-                                        csrf_session, "POST", url, data=data2, timeout=timeout,
-                                        allowed_domains=allowed, limiter=limiter,
-                                    )
-                    if csrf_missing or csrf_refresh_failed:
-                        with SessionLocal() as db:
-                            if not _finding_exists(db, scan_id, url, method, pname, "csrf_required"):
-                                reason = (
-                                    f"required CSRF field(s) {csrf_fields} could not be refreshed from {origin_url}"
-                                    if csrf_missing else
-                                    f"CSRF token refresh at {origin_url} failed before the encoded probe; "
-                                    f"reflection confirmed by primary probe but encoding state unknown"
-                                )
-                                db.add(Finding(
-                                    scan_id=scan_id, url=url, method=method, param=pname,
-                                    context="csrf_required",
-                                    classification=classify_finding("csrf_required", validated=False),
-                                    severity="low",
-                                    payload="",
-                                    evidence=reason,
-                                    request_dump=f"POST {url}\n(missing CSRF token: {csrf_fields})",
-                                    response_snippet="",
-                                ))
-                                db.commit()
-                        continue
+                    outcome = await _probe_post_csrf(
+                        url, origin_url, pname, inj, csrf_fields, hidden_fields, marker,
+                        auth_headers, auth_cookies, allowed, timeout, limiter,
+                    )
                 elif method == "GET":
-                    q = {**other, pname: inj}
-                    status, body, _, truncated = await _fetch(
-                        session, "GET", base_url, params=q, timeout=timeout,
-                        auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
-                        limiter=limiter,
+                    outcome = await _probe_get(
+                        session, base_url, other, pname, inj, marker,
+                        auth_headers, auth_cookies, allowed, timeout, limiter,
                     )
-                    req_dump = f"GET {base_url}?{pname}={inj}"
-                else:
-                    # POST without CSRF fields
-                    data = {**(hidden_fields or {}), pname: inj}
-                    status, body, _, truncated = await _fetch(
-                        session, "POST", url, data=data, timeout=timeout,
-                        auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
-                        limiter=limiter,
+                else:  # POST without CSRF fields
+                    outcome = await _probe_post_plain(
+                        session, url, pname, inj, hidden_fields, marker,
+                        auth_headers, auth_cookies, allowed, timeout, limiter,
                     )
-                    req_dump = f"POST {url}\n" + "\n".join(f"{k}={v}" for k, v in data.items())
 
-                if status == 0:
+                # CSRF token unavailable / not refreshable: record and skip.
+                if outcome.csrf_missing or outcome.csrf_refresh_failed:
+                    _record_csrf_required(
+                        scan_id, url, method, pname, csrf_fields, origin_url,
+                        csrf_missing=outcome.csrf_missing,
+                    )
                     continue
 
-                if (auth_headers or auth_cookies) and looks_like_auth_loss(status, body, login_indicators):
-                    raise AuthLostError(f"Authentication lost while testing {url} (status {status})")
+                # Transport error: do not record; move on.
+                if outcome.status == 0:
+                    continue
 
-                context = classify_context(body, marker)
+                # Auth-loss on the primary probe → escalate.
+                if (auth_headers or auth_cookies) and looks_like_auth_loss(
+                        outcome.status, outcome.body, login_indicators):
+                    raise AuthLostError(
+                        f"Authentication lost while testing {url} (status {outcome.status})"
+                    )
+
+                context = classify_context(outcome.body, marker)
                 reflected = context != "none"
-                if truncated and not reflected:
-                    # The body was cut at MAX_BODY_BYTES before the marker could be
-                    # observed, so reflection state is UNKNOWN: record an honest
-                    # 'unknown' candidate and skip finding creation instead of
-                    # claiming the parameter does not reflect (which the
-                    # truncation could be hiding).
+                if outcome.truncated and not reflected:
+                    # Body was cut at MAX_BODY_BYTES before the marker could be
+                    # observed — reflection state is UNKNOWN. Preserve pre-
+                    # refactor behaviour: record a Candidate with context
+                    # 'unknown' and DO NOT create a Finding (reflected stays
+                    # False).
                     log.warning(
                         "response truncated at %d bytes before marker could be observed: %s %s param=%s",
                         MAX_BODY_BYTES, method, url, pname,
                     )
                     context = "unknown"
 
+                # Demote html/attribute reflections to 'encoded' when the
+                # encoded probe proves the target HTML-escapes the input.
+                # A truncated probe response cannot prove safe encoding —
+                # "probe not found" in a cut body may just mean the reflection
+                # lies beyond the retained prefix, so the demotion requires
+                # the FULL body.
                 if reflected and context in ("html", "attribute"):
-                    probe = ENCODED_PROBE
-                    if method == "GET":
-                        q2 = {**other, pname: probe}
-                        _, body2, _, truncated2 = await _fetch(
-                            session, "GET", base_url, params=q2, timeout=timeout,
-                            auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
-                            limiter=limiter,
-                        )
-                    elif method == "POST" and not csrf_fields:
-                        _, body2, _, truncated2 = await _fetch(
-                            session, "POST", url, data={**(hidden_fields or {}), pname: probe},
-                            timeout=timeout,
-                            auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
-                            limiter=limiter,
-                        )
-                    # CSRF-protected POST: the encoded probe already ran above inside the
-                    # isolated cookie-jar session with a refreshed token; body2 holds its
-                    # response (None when the probe was not applicable/failed).
-                    # A truncated probe response cannot prove safe encoding — "probe not
-                    # found" in a cut body may just mean the reflection lies beyond the
-                    # retained prefix, so the demotion to 'encoded' requires the FULL body.
-                    if body2 and not truncated2 and probe not in body2 and ("&lt;" in body2 or "&gt;" in body2):
+                    if (outcome.encoded_body and not outcome.encoded_truncated
+                            and ENCODED_PROBE not in outcome.encoded_body
+                            and ("&lt;" in outcome.encoded_body or "&gt;" in outcome.encoded_body)):
                         context = "encoded"
 
-                with SessionLocal() as db:
-                    db.add(Candidate(
-                        scan_id=scan_id, url=url, method=method, param=pname,
-                        context=context, reflected_raw=reflected, payload_marker=marker,
-                    ))
-                    s = db.query(Scan).filter(Scan.id == scan_id).first()
-                    if s:
-                        s.stats = {**(s.stats or {}), "params_tested": (s.stats or {}).get("params_tested", 0) + 1}
-                    db.commit()
-
-                    if reflected:
-                        if not _finding_exists(db, scan_id, url, method, pname, context):
-                            snippet_idx = body.find(marker) if marker in body else -1
-                            snippet = body[max(0, snippet_idx - 80): snippet_idx + 160] if snippet_idx >= 0 else ""
-                            db.add(Finding(
-                                scan_id=scan_id, url=url, method=method, param=pname,
-                                context=context,
-                                classification=classify_finding(context, validated=False),
-                                severity=guess_severity(context, validated=False),
-                                payload="<probe>",
-                                evidence=f"marker reflected in {context} context",
-                                request_dump=req_dump,
-                                response_snippet=snippet,
-                            ))
-                            s.stats = {**(s.stats or {}), "candidates": (s.stats or {}).get("candidates", 0) + 1}
-                            db.commit()
+                _record_probe_result(
+                    scan_id, url, method, pname, context, reflected,
+                    marker, outcome.body, outcome.req_dump,
+                )
 
 
 async def _preflight_auth(target: str, allowed: list,

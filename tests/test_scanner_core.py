@@ -118,6 +118,25 @@ def test_classify_false_positive():
     assert classify_finding("none", validated=False) == "false_positive"
 
 
+def test_classify_csrf_token_required():
+    # csrf_required context (produced by the engine when a required CSRF token
+    # cannot be refreshed) must map to csrf_token_required, not false_positive.
+    assert classify_finding("csrf_required", validated=False) == "csrf_token_required"
+
+
+def test_classify_reflection_only_for_unknown_context():
+    # 'unknown' is emitted by the engine when the response body was truncated
+    # at the size cap before the marker could be observed. It means "reflection
+    # observed but rendering context indeterminate", NOT "no reflection".
+    assert classify_finding("unknown", validated=False) == "reflection_only"
+
+
+def test_classify_validated_wins_over_context():
+    # A validated finding is always 'validated', regardless of context.
+    assert classify_finding("encoded", validated=True) == "validated"
+    assert classify_finding("unknown", validated=True) == "validated"
+
+
 # ---------- Scanner state legality ----------
 def test_scan_states_are_documented():
     from models import Scan  # noqa: F401 -- import for schema smoke test
