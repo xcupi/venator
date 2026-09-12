@@ -17,7 +17,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import List, Optional, Set
+from typing import List, Optional, Set, Tuple
 
 import aiohttp
 from sqlalchemy import update
@@ -67,10 +67,48 @@ def _finding_exists(db, scan_id: str, url: str, method: str, param: str, context
     ).first() is not None
 
 
+# Maximum DECOMPRESSED response body bytes retained per request. Bodies larger
+# than this are read incrementally and cut at the limit; the caller receives a
+# `truncated` flag so the reflection engine can stay conservative.
+MAX_BODY_BYTES = max(1024, int(os.environ.get("SCANNER_MAX_BODY_BYTES", str(5 * 1024 * 1024))))
+
+
+async def _read_bounded(resp: aiohttp.ClientResponse, limit: int) -> Tuple[str, bool]:
+    """Read a response body incrementally, capped at ``limit`` bytes.
+
+    aiohttp's default auto-decompression applies to ``resp.content``, so the cap
+    bounds the DECOMPRESSED body held in memory — not merely the compressed wire
+    size — and Content-Length is never trusted for allocation. Memory overhead
+    beyond ``limit`` is at most one chunk (64 KiB).
+
+    Returns (text, truncated). When the body exceeds the limit, ``truncated`` is
+    True and ``text`` is a strict prefix of the full body — callers must NOT
+    treat "marker not found" in a truncated body as "no reflection".
+    """
+    buf = bytearray()
+    truncated = False
+    async for chunk in resp.content.iter_chunked(65536):
+        overflow = len(buf) + len(chunk) - limit
+        if overflow > 0:
+            buf.extend(chunk[: len(chunk) - overflow])
+            truncated = True
+            break
+        buf.extend(chunk)
+    # resp.get_encoding() matches the decoding semantics of resp.text()
+    return bytes(buf).decode(resp.get_encoding(), errors="ignore"), truncated
+
+
 async def _fetch(session: aiohttp.ClientSession, method: str, url: str,
                  params=None, data=None, timeout: int = 15,
                  auth_headers=None, auth_cookies=None, allowed_domains=None):
-    """Scope-safe HTTP fetch. Never attaches auth to out-of-scope hosts."""
+    """Scope-safe HTTP fetch. Never attaches auth to out-of-scope hosts.
+
+    The response body is streamed and capped at MAX_BODY_BYTES (env
+    SCANNER_MAX_BODY_BYTES, default 5 MiB) of decompressed content.
+
+    Returns (status, body, final_url, truncated). On transport errors returns
+    (0, "", str(exc), False) as before.
+    """
     hdrs = {}
     cookies = None
     if auth_headers or auth_cookies:
@@ -83,10 +121,10 @@ async def _fetch(session: aiohttp.ClientSession, method: str, url: str,
             method, url, params=params, data=data, timeout=timeout,
             allow_redirects=True, headers=hdrs or None, cookies=cookies,
         ) as resp:
-            body = await resp.text(errors="ignore")
-            return resp.status, body, str(resp.url)
+            body, truncated = await _read_bounded(resp, MAX_BODY_BYTES)
+            return resp.status, body, str(resp.url), truncated
     except Exception as e:
-        return 0, "", str(e)
+        return 0, "", str(e), False
 
 
 async def _crawl(scan_id: str, allowed: list, excluded: list, target: str, cfg: dict,
@@ -108,12 +146,16 @@ async def _crawl(scan_id: str, allowed: list, excluded: list, target: str, cfg: 
                 continue
             seen.add(n)
 
-            status, body, final_url = await _fetch(
+            status, body, final_url, truncated = await _fetch(
                 session, "GET", n, timeout=timeout,
                 auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
             )
             if status == 0:
                 continue
+            if truncated:
+                # Only the retained prefix is parsed for links/forms; never crash
+                # or treat truncation as an empty page.
+                log.debug("crawl: response truncated at %d bytes for %s", MAX_BODY_BYTES, n)
 
             # Auth-loss detection on crawler responses
             if (auth_headers or auth_cookies) and looks_like_auth_loss(status, body, login_indicators):
@@ -199,7 +241,8 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                 fresh_csrf = {}
                 csrf_missing = False
                 csrf_refresh_failed = False
-                body2 = None  # encoded-probe response (populated per path below)
+                body2 = None        # encoded-probe response (populated per path below)
+                truncated2 = False  # whether the encoded-probe response was cut
                 if method == "POST" and csrf_fields and origin_url:
                     jar = aiohttp.CookieJar(unsafe=True)
                     async with aiohttp.ClientSession(
@@ -207,7 +250,7 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                         cookies=auth_cookies or None,
                         headers={"User-Agent": "reflected-xss-hunter/1.0", **(auth_headers or {})},
                     ) as csrf_session:
-                        _, origin_body, _ = await _fetch(
+                        _, origin_body, _, _ = await _fetch(
                             csrf_session, "GET", origin_url, timeout=timeout,
                             allowed_domains=allowed,
                         )
@@ -217,7 +260,7 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
 
                         if not csrf_missing:
                             data = {**(hidden_fields or {}), **fresh_csrf, pname: inj}
-                            status, body, _ = await _fetch(
+                            status, body, _, truncated = await _fetch(
                                 csrf_session, "POST", url, data=data, timeout=timeout,
                                 allowed_domains=allowed,
                             )
@@ -232,7 +275,7 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                             # Gate matches the GET/non-CSRF paths: only probe when the primary
                             # reflection landed in html/attribute context.
                             if body and classify_context(body, marker) in ("html", "attribute"):
-                                _, origin_body2, _ = await _fetch(
+                                _, origin_body2, _, _ = await _fetch(
                                     csrf_session, "GET", origin_url, timeout=timeout,
                                     allowed_domains=allowed,
                                 )
@@ -241,7 +284,7 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                                     csrf_refresh_failed = True
                                 else:
                                     data2 = {**(hidden_fields or {}), **fresh_csrf2, pname: ENCODED_PROBE}
-                                    _, body2, _ = await _fetch(
+                                    _, body2, _, truncated2 = await _fetch(
                                         csrf_session, "POST", url, data=data2, timeout=timeout,
                                         allowed_domains=allowed,
                                     )
@@ -268,7 +311,7 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                         continue
                 elif method == "GET":
                     q = {**other, pname: inj}
-                    status, body, _ = await _fetch(
+                    status, body, _, truncated = await _fetch(
                         session, "GET", base_url, params=q, timeout=timeout,
                         auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
                     )
@@ -276,7 +319,7 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                 else:
                     # POST without CSRF fields
                     data = {**(hidden_fields or {}), pname: inj}
-                    status, body, _ = await _fetch(
+                    status, body, _, truncated = await _fetch(
                         session, "POST", url, data=data, timeout=timeout,
                         auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
                     )
@@ -290,17 +333,28 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
 
                 context = classify_context(body, marker)
                 reflected = context != "none"
+                if truncated and not reflected:
+                    # The body was cut at MAX_BODY_BYTES before the marker could be
+                    # observed, so reflection state is UNKNOWN: record an honest
+                    # 'unknown' candidate and skip finding creation instead of
+                    # claiming the parameter does not reflect (which the
+                    # truncation could be hiding).
+                    log.warning(
+                        "response truncated at %d bytes before marker could be observed: %s %s param=%s",
+                        MAX_BODY_BYTES, method, url, pname,
+                    )
+                    context = "unknown"
 
                 if reflected and context in ("html", "attribute"):
                     probe = ENCODED_PROBE
                     if method == "GET":
                         q2 = {**other, pname: probe}
-                        _, body2, _ = await _fetch(
+                        _, body2, _, truncated2 = await _fetch(
                             session, "GET", base_url, params=q2, timeout=timeout,
                             auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
                         )
                     elif method == "POST" and not csrf_fields:
-                        _, body2, _ = await _fetch(
+                        _, body2, _, truncated2 = await _fetch(
                             session, "POST", url, data={**(hidden_fields or {}), pname: probe},
                             timeout=timeout,
                             auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
@@ -308,7 +362,10 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                     # CSRF-protected POST: the encoded probe already ran above inside the
                     # isolated cookie-jar session with a refreshed token; body2 holds its
                     # response (None when the probe was not applicable/failed).
-                    if body2 and probe not in body2 and ("&lt;" in body2 or "&gt;" in body2):
+                    # A truncated probe response cannot prove safe encoding — "probe not
+                    # found" in a cut body may just mean the reflection lies beyond the
+                    # retained prefix, so the demotion to 'encoded' requires the FULL body.
+                    if body2 and not truncated2 and probe not in body2 and ("&lt;" in body2 or "&gt;" in body2):
                         context = "encoded"
 
                 with SessionLocal() as db:
@@ -347,7 +404,7 @@ async def _preflight_auth(target: str, allowed: list,
     if not in_scope(probe_url, allowed, []):
         return False, 0, probe_url, "check_url is outside project scope"
     async with aiohttp.ClientSession(headers={"User-Agent": "reflected-xss-hunter/1.0"}) as session:
-        status, body, final = await _fetch(
+        status, body, final, _ = await _fetch(
             session, "GET", probe_url, timeout=timeout,
             auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
         )

@@ -195,22 +195,22 @@ def _make_fake_csrf_server(*, reflect_mode="raw", fail_refresh=False):
         if method == "GET" and url.endswith("/form"):
             if fail_refresh and any(e[0] == "POST" for e in log):
                 log.append(("GET-origin-no-token", sid, None))
-                return 200, "<html><body>temporarily unavailable</body></html>", url
+                return 200, "<html><body>temporarily unavailable</body></html>", url, False
             tok = _new_token()
             sessions[sid] = tok
             log.append(("GET-origin", sid, None))
-            return 200, f"<form><input name='csrf_token' value='{tok}'></form>", url
+            return 200, f"<form><input name='csrf_token' value='{tok}'></form>", url, False
         if method == "POST":
             log.append(("POST", sid, dict(data or {})))
             supplied = (data or {}).get("csrf_token", "")
             if not supplied or supplied != sessions.get(sid):
-                return 403, "<html><body>403 CSRF token invalid</body></html>", url
+                return 403, "<html><body>403 CSRF token invalid</body></html>", url, False
             comment = str((data or {}).get("comment", ""))
             sessions[sid] = _new_token()  # rotate on every accepted POST
             if reflect_mode == "raw":
-                return 200, f"<html><body>Posted: {comment}</body></html>", url
-            return 200, f"<html><body>Posted: {_html.escape(comment)}</body></html>", url
-        return 404, "", url
+                return 200, f"<html><body>Posted: {comment}</body></html>", url, False
+            return 200, f"<html><body>Posted: {_html.escape(comment)}</body></html>", url, False
+        return 404, "", url, False
 
     return fake_fetch, log
 
@@ -312,7 +312,7 @@ def _make_echo_fake(*, escape_values=False):
         vals = " ".join(parts)
         if escape_values:
             vals = _html.escape(vals)
-        return 200, f"<html><body>Hello {vals} world</body></html>", url
+        return 200, f"<html><body>Hello {vals} world</body></html>", url, False
     return fake_fetch
 
 

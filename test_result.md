@@ -157,6 +157,57 @@
 ##           and conditional encoded probe submission. No behavior changes outside CSRF
 ##           POST branch. Classification model unchanged. Fix satisfies all requirements.
 
+##   - task: "Phase 1 Item 4 - HTTP response body size protection"
+##     implemented: true
+##     working: true
+##     file: "backend/scanner_engine.py"
+##     stuck_count: 0
+##     priority: "high"
+##     needs_retesting: false
+##     status_history:
+##         -working: true
+##         -agent: "main"
+##         -comment: >
+##           _fetch now streams responses via _read_bounded (iter_chunked 64KiB)
+##           capped at MAX_BODY_BYTES (env SCANNER_MAX_BODY_BYTES, default 5 MiB)
+##           of DECOMPRESSED content; returns (status, body, final_url, truncated).
+##           All 10 call sites updated. Reflection engine: truncated+no-marker ->
+##           Candidate context 'unknown', NO Finding (never reflection_only /
+##           safely_encoded / false_positive); encoded-probe demotion requires
+##           non-truncated probe body. docker-compose + README document the new
+##           env var. Test fakes in items 1-2 updated to 4-tuple contract.
+##           8 new tests in tests/test_response_size.py (stdlib HTTP server).
+##           Full suite: 93 passed.
+##         -working: true
+##         -agent: "testing"
+##         -comment: >
+##           VERIFIED: All 8 tests in test_response_size.py passed (1.69s). Full
+##           regression suite: 93 passed (7.61s). Tests confirmed: (1) Small
+##           response below limit → complete body, truncated=False, detection
+##           unchanged (potential finding, context html); (2) 2 MiB response with
+##           64 KiB cap → truncated=True, returned body ≤ 64 KiB, strict prefix of
+##           full body; (3) Marker BEFORE cutoff → finding still potential/html;
+##           (4) Marker AFTER cutoff → NO finding, exactly one Candidate with
+##           context='unknown', reflected_raw=False (never classified as
+##           absent/encoded/false-positive); (5) No Content-Length → cap still
+##           enforced; (6) Default limit == 5 MiB; (7) SCANNER_MAX_BODY_BYTES env
+##           override works. Code review confirmed: _read_bounded correctly
+##           implements incremental read with 64 KiB chunks, caps at limit, returns
+##           strict prefix when truncated, memory overhead ≤ one chunk beyond limit;
+##           all 10 _fetch call sites correctly unpack 4-tuple; truncation flag
+##           propagates correctly; reflection engine (lines 336-346) sets
+##           context='unknown' when truncated AND marker not found, preventing
+##           silent misclassification; encoded-probe demotion (line 368) requires
+##           'not truncated2'; test fakes in test_finding_dedup.py and
+##           test_csrf_encoded_probe.py correctly updated to 4-tuple contract;
+##           docker-compose.yml and README.md document SCANNER_MAX_BODY_BYTES.
+##           Pre-existing test failures in /app/backend/tests/ (test_api_e2e.py
+##           test_scan_full_flow, test_auth_scan_e2e.py collection errors) are
+##           unrelated to this fix (require REACT_APP_BACKEND_URL for live
+##           deployment testing). Fix satisfies all requirements: bounded memory,
+##           truncation never silently treated as complete, marker-after-truncation
+##           never classified as absent/encoded/false-positive.
+
 ##   - task: "Phase 1 Item 3 - Atomic QUEUED to RUNNING scan claiming"
 ##     implemented: true
 ##     working: true
@@ -209,7 +260,7 @@
 
 ## test_plan:
 ##   current_focus:
-##     - "Phase 1 Item 3 - Atomic QUEUED to RUNNING scan claiming"
+##     - "Phase 1 Item 4 - HTTP response body size protection"
 ##   stuck_tasks: []
 ##   test_all: true
 ##   test_priority: "high_first"
@@ -251,3 +302,21 @@
 ##       session held across scan execution, compatible with PostgreSQL and SQLite,
 ##       no schema changes. Fix satisfies all requirements. Ready for main agent to
 ##       summarize and finish.
+##     -agent: "testing"
+##     -message: >
+##       Phase 1 Item 4 verification COMPLETE. All 8 tests in test_response_size.py
+##       passed (1.69s). Full regression suite: 93 passed (7.61s). Tests confirmed
+##       all requirements: (1) bounded memory via incremental 64 KiB chunked reads
+##       capped at MAX_BODY_BYTES (default 5 MiB, env-configurable); (2) truncation
+##       never silently treated as complete - truncated responses return strict
+##       prefix with truncated=True flag; (3) marker-after-truncation never
+##       classified as absent/encoded/false-positive - creates Candidate with
+##       context='unknown' and NO Finding; (4) marker-before-truncation still
+##       detected correctly (potential/html); (5) cap enforced even without
+##       Content-Length; (6) encoded-probe demotion requires non-truncated probe
+##       body. Code review confirmed: _read_bounded correct implementation, all 10
+##       _fetch call sites updated to 4-tuple, truncation flag propagates correctly,
+##       reflection engine handles truncation conservatively (lines 336-346, 368),
+##       test fakes updated, documentation complete. Pre-existing failures in
+##       /app/backend/tests/ unrelated (require live deployment). Fix satisfies all
+##       requirements. Ready for main agent to summarize and finish.

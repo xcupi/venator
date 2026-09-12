@@ -45,7 +45,7 @@ def _install_reflecting_fetch(monkeypatch):
         if data:
             parts.extend(str(v) for v in data.values())
         body = f"<html><body>Hello {' '.join(parts)} world</body></html>"
-        return 200, body, url
+        return 200, body, url, False
 
     monkeypatch.setattr(scanner_engine, "_fetch", fake_fetch)
 

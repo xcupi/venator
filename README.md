@@ -102,6 +102,7 @@ Everything is driven by `.env` (see `.env.example`). Highlights:
 | `SECRET_KEY`              | JWT signing key                                     |
 | `ADMIN_EMAIL/ADMIN_PASSWORD` | Bootstrap admin created on first run             |
 | `SCANNER_MAX_URLS/DEPTH`  | Crawler bounds                                      |
+| `SCANNER_MAX_BODY_BYTES`  | Max decompressed response bytes kept per request (default 5 MiB); bodies past the cap are truncated and flagged |
 | `BROWSER_HEADLESS`        | Toggle Playwright headless mode                     |
 | `REACT_APP_BACKEND_URL`   | Backend URL baked into the frontend build           |
 

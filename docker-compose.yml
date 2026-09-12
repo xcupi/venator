@@ -48,6 +48,7 @@ services:
       DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-xss}:${POSTGRES_PASSWORD:-xsspwd}@db:5432/${POSTGRES_DB:-xsshunter}
       SCANNER_POLL_INTERVAL: ${SCANNER_POLL_INTERVAL:-2}
       SCANNER_MAX_CONCURRENCY: ${SCANNER_MAX_CONCURRENCY:-5}
+      SCANNER_MAX_BODY_BYTES: ${SCANNER_MAX_BODY_BYTES:-5242880}
 
   browser-worker:
     build:
