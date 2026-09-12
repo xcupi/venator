@@ -3,8 +3,6 @@ import { useParams } from "react-router-dom";
 import { api } from "@/lib/api";
 import { Download, RefreshCcw } from "lucide-react";
 
-const BACKEND = process.env.REACT_APP_BACKEND_URL || "";
-
 const badge = (cls) => ({
   validated: "bg-red-500/10 text-red-300 border-red-500/40",
   potential: "bg-amber-500/10 text-amber-300 border-amber-500/40",
@@ -27,10 +25,13 @@ export default function ScanDetail() {
   };
   useEffect(() => { load().catch(() => {}); const t = setInterval(load, 3000); return () => clearInterval(t); }, [id]);
 
-  const exportUrl = (fmt) => {
-    const token = localStorage.getItem("xss_token");
-    return `${BACKEND}/api/scans/${id}/export?format=${fmt}&_t=${Date.now()}#${token}`;
-  };
+  // Exports go through the authenticated axios client (`api`) as a blob and are
+  // downloaded via an in-memory object URL — the JWT is sent as an
+  // Authorization header, never placed in the URL. A previous helper
+  // (`exportUrl`) constructed a URL with the token in the fragment
+  // (`...#${token}`). It was unused, but leaving it in place risked a future
+  // `<a href={exportUrl(...)}>` accidentally exposing the JWT via
+  // window.location / Referer / browser history. Removed for defence-in-depth.
   const doExport = async (fmt) => {
     const res = await api.get(`/scans/${id}/export?format=${fmt}`, { responseType: "blob" });
     const url = URL.createObjectURL(res.data);
