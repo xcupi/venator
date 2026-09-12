@@ -67,12 +67,32 @@ def normalize_url(url: str) -> str:
 
 # ---------- Parameter discovery ----------
 
+# Field-name patterns commonly used to store CSRF tokens across frameworks
+CSRF_FIELD_PATTERNS = re.compile(
+    r"^("
+    r"csrf(_?token)?|_?csrf|_?token|"
+    r"authenticity_token|"
+    r"csrfmiddlewaretoken|"
+    r"xsrf(_?token)?|"
+    r"__requestverificationtoken"
+    r")$",
+    re.IGNORECASE,
+)
+
+
+def is_csrf_field(name: str) -> bool:
+    return bool(name) and bool(CSRF_FIELD_PATTERNS.match(name.strip()))
+
+
 @dataclass
 class ParamTarget:
     url: str
     method: str
-    params: List[str] = field(default_factory=list)  # names to fuzz
-    form_data: dict = field(default_factory=dict)    # baseline values for POST forms
+    params: List[str] = field(default_factory=list)   # names to fuzz (excludes CSRF fields)
+    form_data: dict = field(default_factory=dict)     # baseline values for POST forms
+    origin_url: str = ""                              # page the form was found on (for refetching CSRF)
+    csrf_fields: List[str] = field(default_factory=list)  # names of CSRF hidden fields discovered
+    hidden_fields: dict = field(default_factory=dict)     # hidden non-CSRF fields to preserve
 
 
 def extract_get_params(url: str) -> List[str]:
@@ -81,7 +101,11 @@ def extract_get_params(url: str) -> List[str]:
 
 
 def extract_links_and_forms(base_url: str, html_text: str) -> Tuple[List[str], List[ParamTarget]]:
-    """Return (urls, form_targets) discovered inside html_text."""
+    """Return (urls, form_targets) discovered inside html_text.
+
+    Form targets tag CSRF hidden fields separately so the engine can refresh them
+    at test time instead of fuzzing them.
+    """
     soup = BeautifulSoup(html_text or "", "html.parser")
     urls: List[str] = []
     for a in soup.find_all("a", href=True):
@@ -97,15 +121,43 @@ def extract_links_and_forms(base_url: str, html_text: str) -> Tuple[List[str], L
         method = (form.get("method") or "GET").upper()
         params: List[str] = []
         baseline: dict = {}
+        csrf_fields: List[str] = []
+        hidden_fields: dict = {}
         for inp in form.find_all(["input", "textarea", "select"]):
             name = inp.get("name")
             if not name:
                 continue
+            inp_type = (inp.get("type") or "").lower()
+            value = inp.get("value") or ""
+            if is_csrf_field(name):
+                csrf_fields.append(name)
+                hidden_fields[name] = value
+                continue
+            if inp_type == "hidden":
+                hidden_fields[name] = value
+                # hidden non-CSRF fields are preserved but also fuzzed
             params.append(name)
-            baseline[name] = inp.get("value") or "test"
+            baseline[name] = value or "test"
         if params:
-            forms.append(ParamTarget(url=action, method=method, params=params, form_data=baseline))
+            forms.append(ParamTarget(
+                url=action, method=method, params=params, form_data=baseline,
+                origin_url=base_url, csrf_fields=csrf_fields, hidden_fields=hidden_fields,
+            ))
     return urls, forms
+
+
+def extract_csrf_values(html_text: str, field_names: Iterable[str]) -> dict:
+    """Return {name: value} for CSRF fields present in the given HTML."""
+    if not html_text or not field_names:
+        return {}
+    soup = BeautifulSoup(html_text, "html.parser")
+    wanted = {n.lower() for n in field_names}
+    out = {}
+    for inp in soup.find_all(["input", "textarea"]):
+        n = inp.get("name")
+        if n and n.lower() in wanted:
+            out[n] = inp.get("value") or ""
+    return out
 
 
 # ---------- Reflection & context ----------
@@ -181,6 +233,8 @@ def classify_finding(context: str, validated: bool) -> str:
     """Map (context, validated) -> classification label."""
     if validated:
         return "validated"
+    if context == "csrf_required":
+        return "csrf_token_required"
     if context == "none":
         return "false_positive"
     if context == "encoded":

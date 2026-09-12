@@ -28,6 +28,7 @@ from scanner_core import (
     ENCODED_PROBE,
     classify_context,
     classify_finding,
+    extract_csrf_values,
     extract_get_params,
     extract_links_and_forms,
     guess_severity,
@@ -131,6 +132,9 @@ async def _crawl(scan_id: str, allowed: list, excluded: list, target: str, cfg: 
                             db.add(DiscoveredURL(
                                 scan_id=scan_id, url=normalize_url(f.url),
                                 method=f.method, params=f.params, depth=depth + 1,
+                                origin_url=f.origin_url or final_url,
+                                csrf_fields=list(f.csrf_fields or []),
+                                hidden_fields=dict(f.hidden_fields or {}),
                             ))
                     db.commit()
 
@@ -142,10 +146,14 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
 
     with SessionLocal() as db:
         urls = db.query(DiscoveredURL).filter(DiscoveredURL.scan_id == scan_id).all()
-        url_snapshot = [(u.id, u.url, u.method, u.params) for u in urls]
+        url_snapshot = [
+            (u.id, u.url, u.method, u.params, u.origin_url or "",
+             list(u.csrf_fields or []), dict(u.hidden_fields or {}))
+            for u in urls
+        ]
 
     async with aiohttp.ClientSession(headers={"User-Agent": "reflected-xss-hunter/1.0"}) as session:
-        for uid, url, method, params in url_snapshot:
+        for uid, url, method, params, origin_url, csrf_fields, hidden_fields in url_snapshot:
             with SessionLocal() as db:
                 s = db.query(Scan).filter(Scan.id == scan_id).first()
                 if not s or s.status in ("STOPPING", "STOPPED"):
@@ -166,7 +174,56 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                     for k, v in parse_qsl(url.split("?", 1)[1], keep_blank_values=True):
                         if k != pname:
                             other[k] = v
-                if method == "GET":
+
+                # For POST forms with CSRF fields: refetch origin using a jar-backed session so
+                # any Flask/framework session cookie (e.g. flask_session) set on the refetch is
+                # automatically replayed on the POST. Auth cookies (from the profile) are seeded
+                # into the jar and remain scoped to the target host by aiohttp.
+                fresh_csrf = {}
+                csrf_missing = False
+                if method == "POST" and csrf_fields and origin_url:
+                    jar = aiohttp.CookieJar(unsafe=True)
+                    async with aiohttp.ClientSession(
+                        cookie_jar=jar,
+                        cookies=auth_cookies or None,
+                        headers={"User-Agent": "reflected-xss-hunter/1.0", **(auth_headers or {})},
+                    ) as csrf_session:
+                        _, origin_body, _ = await _fetch(
+                            csrf_session, "GET", origin_url, timeout=timeout,
+                            allowed_domains=allowed,
+                        )
+                        fresh_csrf = extract_csrf_values(origin_body, csrf_fields)
+                        if not fresh_csrf or any(not fresh_csrf.get(n) for n in csrf_fields):
+                            csrf_missing = True
+
+                        if not csrf_missing:
+                            data = {**(hidden_fields or {}), **fresh_csrf, pname: inj}
+                            status, body, _ = await _fetch(
+                                csrf_session, "POST", url, data=data, timeout=timeout,
+                                allowed_domains=allowed,
+                            )
+                            req_dump = f"POST {url}\n" + "\n".join(f"{k}={v}" for k, v in data.items())
+                            # Run the encoded-probe with a re-issued token inside the same jar
+                            _, origin_body2, _ = await _fetch(
+                                csrf_session, "GET", origin_url, timeout=timeout,
+                                allowed_domains=allowed,
+                            )
+                            fresh_csrf2 = extract_csrf_values(origin_body2, csrf_fields) or fresh_csrf
+                    if csrf_missing:
+                        with SessionLocal() as db:
+                            db.add(Finding(
+                                scan_id=scan_id, url=url, method=method, param=pname,
+                                context="csrf_required",
+                                classification=classify_finding("csrf_required", validated=False),
+                                severity="low",
+                                payload="",
+                                evidence=f"required CSRF field(s) {csrf_fields} could not be refreshed from {origin_url}",
+                                request_dump=f"POST {url}\n(missing CSRF token: {csrf_fields})",
+                                response_snippet="",
+                            ))
+                            db.commit()
+                        continue
+                elif method == "GET":
                     q = {**other, pname: inj}
                     status, body, _ = await _fetch(
                         session, "GET", base_url, params=q, timeout=timeout,
@@ -174,12 +231,13 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                     )
                     req_dump = f"GET {base_url}?{pname}={inj}"
                 else:
-                    data = {pname: inj}
+                    # POST without CSRF fields
+                    data = {**(hidden_fields or {}), pname: inj}
                     status, body, _ = await _fetch(
                         session, "POST", url, data=data, timeout=timeout,
                         auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
                     )
-                    req_dump = f"POST {url}\n{pname}={inj}"
+                    req_dump = f"POST {url}\n" + "\n".join(f"{k}={v}" for k, v in data.items())
 
                 if status == 0:
                     continue
@@ -198,11 +256,15 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                             session, "GET", base_url, params=q2, timeout=timeout,
                             auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
                         )
-                    else:
+                    elif method == "POST" and not csrf_fields:
                         _, body2, _ = await _fetch(
-                            session, "POST", url, data={pname: probe}, timeout=timeout,
+                            session, "POST", url, data={**(hidden_fields or {}), pname: probe},
+                            timeout=timeout,
                             auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
                         )
+                    else:
+                        # CSRF-protected POST: skip encoded probe (needs fresh token in same jar)
+                        body2 = None
                     if body2 and probe not in body2 and ("&lt;" in body2 or "&gt;" in body2):
                         context = "encoded"
 

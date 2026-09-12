@@ -11,6 +11,7 @@ const badge = (cls) => ({
   safely_encoded: "bg-blue-500/10 text-blue-300 border-blue-500/40",
   reflection_only: "bg-zinc-800 text-zinc-300 border-zinc-700",
   false_positive: "bg-zinc-900 text-zinc-500 border-zinc-800",
+  csrf_token_required: "bg-fuchsia-500/10 text-fuchsia-300 border-fuchsia-500/40",
 }[cls] || "bg-zinc-800 text-zinc-300 border-zinc-700");
 
 export default function ScanDetail() {

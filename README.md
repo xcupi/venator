@@ -167,6 +167,23 @@ browser-based capture helper:
 The capture token expires after 10 minutes and only authorizes cookie import
 for the specific profile it was minted for.
 
+## CSRF token preservation
+
+Many authenticated apps require a fresh CSRF token on every POST. The scanner
+detects hidden CSRF fields on form discovery (matches `csrf_token`, `_csrf`,
+`authenticity_token`, `csrfmiddlewaretoken`, `xsrf`, `__RequestVerificationToken`
+and common variants). At test time, it:
+
+1. Refetches the form's origin URL inside a dedicated cookie jar so any
+   framework session cookie (Flask, Django, Rails) is replayed on the follow-up POST.
+2. Extracts the current CSRF value(s) from the refetched HTML.
+3. Submits the fuzz payload with the fresh token(s) + all preserved hidden fields.
+
+If a required CSRF token cannot be obtained or refreshed (e.g. the origin
+returned without the field), a finding with classification
+`csrf_token_required` is recorded instead of blindly firing the request. The
+scanner never attempts to bypass CSRF protections.
+
 ## Production portability
 
 The application is architecturally identical whether you run it on a laptop, a VPS,

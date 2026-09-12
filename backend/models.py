@@ -89,6 +89,9 @@ class DiscoveredURL(Base):
     params = Column(JSON, default=list)
     depth = Column(Integer, default=0)
     tested = Column(Boolean, default=False)
+    origin_url = Column(Text, default="")           # page the form was discovered on
+    csrf_fields = Column(JSON, default=list)        # names of CSRF hidden fields to refresh at test-time
+    hidden_fields = Column(JSON, default=dict)      # baseline values for hidden fields (CSRF + others)
     scan = relationship("Scan", back_populates="urls")
 
 

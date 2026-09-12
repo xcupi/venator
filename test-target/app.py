@@ -3,10 +3,14 @@
 Contains BOTH public (`/search`) and authenticated (`/dashboard/search`) endpoints so
 authenticated-scan behaviour can be exercised end-to-end. Never expose to the internet.
 """
-from flask import Flask, request, make_response, redirect
+from flask import Flask, request, make_response, redirect, session as flask_session
 from markupsafe import escape
+import secrets
 
 app = Flask(__name__)
+app.secret_key = "test-target-dev-key-not-for-production"
+# Flask signs its own session cookie; avoid clashing with our auth cookie named `session`
+app.config["SESSION_COOKIE_NAME"] = "flask_session"
 
 VALID_SESSIONS = {"authed-session-token-abc123"}
 
@@ -21,6 +25,7 @@ INDEX = """<!doctype html>
   <li><a href='/safe'>/safe</a> (no reflection)</li>
   <li><a href='/form'>/form</a> (POST form)</li>
   <li><a href='/search?q=hello'>/search?q=hello</a> (public search)</li>
+  <li><a href='/csrf-form'>/csrf-form</a> (POST with csrf_token protection)</li>
   <li><a href='/login'>/login</a> · <a href='/dashboard'>/dashboard</a> (authed area)</li>
 </ul>
 </body></html>"""
@@ -117,7 +122,8 @@ def dashboard():
     return """<html><body>
       <h1>Dashboard</h1><a href='/logout'>Sign out</a>
       <ul><li><a href='/dashboard/search?q=hello'>/dashboard/search?q=hello</a></li>
-          <li><a href='/dashboard/profile?name=alice'>/dashboard/profile?name=alice</a></li></ul>
+          <li><a href='/dashboard/profile?name=alice'>/dashboard/profile?name=alice</a></li>
+          <li><a href='/dashboard/csrf-search'>/dashboard/csrf-search</a> (CSRF protected)</li></ul>
     </body></html>"""
 
 
@@ -135,6 +141,55 @@ def dashboard_profile():
         return redirect("/login")
     name = request.args.get("name", "")
     return f'<html><body><input value="{name}"><a href="/logout">Sign out</a></body></html>'
+
+
+# --- CSRF-protected form (public) ---
+def _issue_csrf():
+    tok = secrets.token_hex(16)
+    flask_session["csrf"] = tok
+    return tok
+
+
+@app.route("/csrf-form", methods=["GET", "POST"])
+def csrf_form():
+    if request.method == "POST":
+        expected = flask_session.get("csrf", "")
+        supplied = request.form.get("csrf_token", "")
+        if not expected or supplied != expected:
+            return "<html><body>403 CSRF token invalid</body></html>", 403
+        comment = request.form.get("comment", "")
+        # rotate the token like most frameworks
+        flask_session.pop("csrf", None)
+        return f"<html><body>Posted: {comment}</body></html>"  # UNSAFE reflection
+    tok = _issue_csrf()
+    return f"""<html><body>
+      <form method='POST' action='/csrf-form'>
+        <input type='hidden' name='csrf_token' value='{tok}'>
+        <input name='comment' value='hi'>
+        <button>Send</button>
+      </form></body></html>"""
+
+
+# --- CSRF + auth protected (uses same csrf_token field name) ---
+@app.route("/dashboard/csrf-search", methods=["GET", "POST"])
+def dashboard_csrf_search():
+    if not _authed():
+        return redirect("/login")
+    if request.method == "POST":
+        expected = flask_session.get("csrf", "")
+        supplied = request.form.get("csrf_token", "")
+        if not expected or supplied != expected:
+            return "<html><body>403 CSRF token invalid</body></html>", 403
+        q = request.form.get("q", "")
+        flask_session.pop("csrf", None)
+        return f"<html><body>Auth+CSRF results for: {q}<a href='/logout'>Sign out</a></body></html>"
+    tok = _issue_csrf()
+    return f"""<html><body>
+      <form method='POST' action='/dashboard/csrf-search'>
+        <input type='hidden' name='csrf_token' value='{tok}'>
+        <input name='q' value='hello'>
+        <button>Search</button>
+      </form><a href='/logout'>Sign out</a></body></html>"""
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ const badge = (cls) => ({
   safely_encoded: "text-blue-300 border-blue-500/40",
   reflection_only: "text-zinc-300 border-zinc-700",
   false_positive: "text-zinc-500 border-zinc-800",
+  csrf_token_required: "text-fuchsia-300 border-fuchsia-500/40",
 }[cls] || "text-zinc-300 border-zinc-700");
 
 export default function Findings() {
