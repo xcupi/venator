@@ -63,7 +63,8 @@ def public_auth_profile(profile: Any) -> dict:
     ptype = profile.type
 
     # Common fields (non-sensitive)
-    for k in ("check_url", "login_indicators", "authed_indicators", "header_name"):
+    for k in ("check_url", "login_indicators", "authed_indicators", "header_name",
+              "captured_at", "captured_final_url"):
         if k in cfg:
             masked[k] = cfg[k]
 

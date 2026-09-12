@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from "react";
 import { api } from "@/lib/api";
-import { KeyRound, Plus, Trash2, ShieldCheck, ShieldAlert, PlayCircle } from "lucide-react";
+import { KeyRound, Plus, Trash2, ShieldCheck, ShieldAlert, PlayCircle, ScanLine, X, Copy } from "lucide-react";
 
 const TYPES = [
   { v: "cookie", l: "Cookie" },
@@ -31,6 +31,8 @@ export default function AuthProfiles() {
   });
   const [testResult, setTestResult] = useState({});
   const [error, setError] = useState("");
+  const [captureModal, setCaptureModal] = useState(null);  // {profileId, loginUrl, successHint, token, command, waiting, imported}
+  const [copied, setCopied] = useState(false);
 
   const load = async () => {
     const [p, a] = await Promise.all([api.get("/projects"), api.get("/auth-profiles")]);
@@ -68,6 +70,61 @@ export default function AuthProfiles() {
     } catch (err) {
       setTestResult((r) => ({ ...r, [id]: { status: "INVALID", notes: err?.response?.data?.detail || String(err) } }));
     }
+  };
+
+  const beginCapture = async (profile) => {
+    const loginUrl = window.prompt(
+      "Login URL (must be inside project scope):",
+      profile.config?.check_url?.replace(/\/dashboard.*$/, "/login") || "http://localhost:5000/login",
+    );
+    if (!loginUrl) return;
+    const successHint = window.prompt(
+      "Optional: URL substring that signals successful login (e.g. '/dashboard'). Leave blank to click a button in the browser.",
+      "/dashboard",
+    ) || "";
+    try {
+      const { data } = await api.post(`/auth-profiles/${profile.id}/capture-token`, {
+        login_url: loginUrl,
+        success_url_contains: successHint,
+      });
+      setCaptureModal({
+        profileId: profile.id,
+        loginUrl,
+        successHint,
+        token: data.token,
+        command: data.helper_command,
+        waiting: true,
+        imported: 0,
+      });
+    } catch (err) {
+      alert("Could not start capture: " + (err?.response?.data?.detail || err.message));
+    }
+  };
+
+  // Poll for capture completion (server-side profile.config.captured_at appears once imported)
+  useEffect(() => {
+    if (!captureModal?.waiting) return;
+    const t = setInterval(async () => {
+      try {
+        const { data } = await api.get(`/auth-profiles?project_id=${
+          profiles.find(p => p.id === captureModal.profileId)?.project_id || ""
+        }`);
+        const me = data.find((p) => p.id === captureModal.profileId);
+        if (me?.config?.captured_at) {
+          const cookies = me.config.cookies || [];
+          setCaptureModal((m) => m && { ...m, waiting: false, imported: cookies.length });
+          setProfiles(data);
+        }
+      } catch (e) { /* ignore */ }
+    }, 2000);
+    return () => clearInterval(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [captureModal?.waiting]);
+
+  const copyCmd = () => {
+    if (!captureModal?.command) return;
+    navigator.clipboard.writeText(captureModal.command);
+    setCopied(true); setTimeout(() => setCopied(false), 1500);
   };
 
   // ---------- Form editors per type ----------
@@ -220,9 +277,12 @@ export default function AuthProfiles() {
                     <td className="px-4 py-3 text-center text-zinc-400 text-xs">{proj?.name || "-"}</td>
                     <td className="px-4 py-3 text-center text-zinc-400 text-xs">{secretCount} masked</td>
                     <td className="px-4 py-3 text-center">
-                      <div className="flex items-center justify-center gap-2">
+                      <div className="flex items-center justify-center gap-2 flex-wrap">
                         <button data-testid={`test-auth-${p.id}`} onClick={() => test(p.id)} className="text-xs text-emerald-400 hover:underline flex items-center gap-1">
                           <PlayCircle size={12} /> Test
+                        </button>
+                        <button data-testid={`capture-login-${p.id}`} onClick={() => beginCapture(p)} className="text-xs text-fuchsia-400 hover:underline flex items-center gap-1">
+                          <ScanLine size={12} /> Capture Login
                         </button>
                         {tr && (
                           <span data-testid={`test-result-${p.id}`} className={`text-[10px] px-2 py-0.5 rounded border ${statusPill(tr.status)}`}>
@@ -231,6 +291,9 @@ export default function AuthProfiles() {
                         )}
                       </div>
                       {tr?.notes && <div className="text-[10px] text-zinc-500 mt-1 truncate max-w-[180px]" title={tr.notes}>{tr.notes}</div>}
+                      {p.config?.captured_at && (
+                        <div className="text-[10px] text-fuchsia-400 mt-1">captured {new Date(p.config.captured_at).toLocaleTimeString()}</div>
+                      )}
                     </td>
                     <td className="px-4 py-3 text-right">
                       <button data-testid={`delete-ap-${p.id}`} onClick={() => remove(p.id)} className="text-zinc-500 hover:text-red-400"><Trash2 size={16} /></button>
@@ -242,6 +305,47 @@ export default function AuthProfiles() {
           </table>
         </div>
       </div>
+
+      {captureModal && (
+        <div data-testid="capture-modal" className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-6">
+          <div className="max-w-2xl w-full bg-zinc-900 border border-zinc-800 rounded-lg p-6 text-zinc-100">
+            <div className="flex items-start justify-between mb-4">
+              <div>
+                <div className="text-xs text-fuchsia-400 tracking-widest">// CAPTURE LOGIN</div>
+                <h2 className="text-xl font-bold mt-1">Log in through a real browser</h2>
+              </div>
+              <button data-testid="capture-close" onClick={() => setCaptureModal(null)} className="text-zinc-400 hover:text-zinc-200"><X size={18} /></button>
+            </div>
+            <p className="text-sm text-zinc-400 mb-3">
+              Run this helper on your machine. A Chromium window opens at the login URL —
+              complete sign-in there, then the session is imported.
+            </p>
+            <div className="relative">
+              <pre className="bg-zinc-950 border border-zinc-800 rounded p-3 text-emerald-300 text-xs overflow-auto whitespace-pre-wrap">{captureModal.command}</pre>
+              <button data-testid="capture-copy" onClick={copyCmd} className="absolute top-2 right-2 text-xs bg-zinc-900 border border-zinc-700 hover:border-emerald-500/40 px-2 py-1 rounded text-zinc-300 flex items-center gap-1">
+                <Copy size={12} /> {copied ? "Copied!" : "Copy"}
+              </button>
+            </div>
+            <div className="mt-4 text-[11px] text-zinc-500 space-y-1">
+              <div>Requirements: <code className="text-zinc-300">pip install playwright requests</code> then <code className="text-zinc-300">playwright install chromium</code></div>
+              <div>Token expires in ~10 minutes. Cookies from out-of-scope hosts are dropped automatically.</div>
+              <div>Login URL: <code className="text-zinc-300">{captureModal.loginUrl}</code></div>
+              {captureModal.successHint && <div>Auto-detect on URL containing: <code className="text-zinc-300">{captureModal.successHint}</code></div>}
+            </div>
+            <div className="mt-5">
+              {captureModal.waiting ? (
+                <div data-testid="capture-waiting" className="text-sm text-amber-300 flex items-center gap-2">
+                  <div className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" /> Waiting for capture…
+                </div>
+              ) : (
+                <div data-testid="capture-done" className="text-sm text-emerald-400">
+                  ✓ Imported {captureModal.imported} cookie(s). Profile is ready.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

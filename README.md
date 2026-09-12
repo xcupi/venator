@@ -142,6 +142,31 @@ PYTHONPATH=../backend pytest -q
 - Scanner respects `allowed_domains` and `excluded_paths` on every request.
 - Change the admin password before use.
 
+## Browser Login Capture (authenticated sessions)
+
+For apps behind a real login you don't want to hand-copy cookies for, use the
+browser-based capture helper:
+
+1. In the web UI, create (or open) an Auth Profile and click **Capture Login**.
+2. Enter the login URL (must be inside the project's `allowed_domains`) and
+   optionally a URL substring that signals successful login (e.g. `/dashboard`).
+3. Copy the shown command and run it on **your own machine**:
+
+   ```bash
+   pip install playwright requests
+   playwright install chromium
+   python scripts/capture_login.py --api http://localhost:8001 --token <TOKEN>
+   ```
+
+4. A real Chromium window opens at the login URL. Complete sign-in there. When
+   the URL matches the success hint (or you click the floating **"I'm signed in"**
+   button), cookies are extracted and uploaded back to the backend.
+5. The backend **drops any cookie not belonging to an in-scope host**, masks
+   the remaining values in the UI, and marks the profile ready for scans.
+
+The capture token expires after 10 minutes and only authorizes cookie import
+for the specific profile it was minted for.
+
 ## Production portability
 
 The application is architecturally identical whether you run it on a laptop, a VPS,

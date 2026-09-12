@@ -304,6 +304,134 @@ async def test_auth_profile(profile_id: str, body: TestAuthIn,
     }
 
 
+# ---------- Browser Login Capture ----------
+# Flow: user clicks "Capture Login" -> backend mints short-lived JWT bound to the
+# profile id. User runs `python scripts/capture_login.py --token ... --login-url ...`
+# on their machine. That script launches Playwright chromium in headed mode,
+# waits for the user to complete login, then POSTs cookies here. Backend replaces
+# the profile's config.cookies with the captured session.
+
+CAPTURE_TOKEN_TTL = 600  # 10 minutes
+
+
+class CaptureTokenIn(BaseModel):
+    login_url: str
+    success_url_contains: Optional[str] = None  # optional heuristic: URL must contain this to be considered "logged in"
+
+
+class CaptureImportIn(BaseModel):
+    token: str
+    cookies: List[dict]        # [{"name": "session", "value": "..."}, ...]
+    final_url: Optional[str] = None
+    user_agent: Optional[str] = None
+
+
+@api.post("/auth-profiles/{profile_id}/capture-token")
+def issue_capture_token(profile_id: str, body: CaptureTokenIn,
+                         user: User = Depends(current_user), db: Session = Depends(get_db)):
+    """Issue a short-lived, single-purpose JWT for the capture-login CLI helper."""
+    import jwt as pyjwt
+    from datetime import timedelta as _td
+    p = db.query(AuthProfile).filter(AuthProfile.id == profile_id).first()
+    if not p:
+        raise HTTPException(404, "Auth profile not found")
+    project = db.query(Project).filter(Project.id == p.project_id).first()
+    if not project:
+        raise HTTPException(404, "Project not found")
+    # Scope guard: login_url must be inside project scope so we never send
+    # a capture flow to an unrelated host.
+    from scanner_core import in_scope as _in_scope
+    if not _in_scope(body.login_url, list(project.allowed_domains or []), []):
+        raise HTTPException(400, "login_url is outside project scope")
+
+    from auth import SECRET_KEY, ALGORITHM  # noqa: WPS433
+    payload = {
+        "purpose": "capture_login",
+        "profile_id": profile_id,
+        "login_url": body.login_url,
+        "success_url_contains": body.success_url_contains or "",
+        "exp": datetime.now(timezone.utc) + _td(seconds=CAPTURE_TOKEN_TTL),
+    }
+    token = pyjwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+    return {
+        "token": token,
+        "expires_in": CAPTURE_TOKEN_TTL,
+        "profile_id": profile_id,
+        "login_url": body.login_url,
+        "helper_command": (
+            f"python scripts/capture_login.py "
+            f"--api {os.environ.get('PUBLIC_API_URL','http://localhost:8001')} "
+            f"--token {token}"
+        ),
+    }
+
+
+@api.post("/auth-profiles/import-session")
+def import_captured_session(body: CaptureImportIn, db: Session = Depends(get_db)):
+    """Endpoint the capture-login CLI helper posts to. Auth via the capture token,
+    NOT the user JWT — this lets the helper run standalone on the user's machine."""
+    import jwt as pyjwt
+    from auth import SECRET_KEY, ALGORITHM  # noqa: WPS433
+    try:
+        claims = pyjwt.decode(body.token, SECRET_KEY, algorithms=[ALGORITHM])
+    except pyjwt.PyJWTError as e:
+        raise HTTPException(401, f"invalid capture token: {e}")
+    if claims.get("purpose") != "capture_login":
+        raise HTTPException(401, "wrong token purpose")
+
+    profile_id = claims.get("profile_id")
+    p = db.query(AuthProfile).filter(AuthProfile.id == profile_id).first()
+    if not p:
+        raise HTTPException(404, "Auth profile not found")
+    project = db.query(Project).filter(Project.id == p.project_id).first()
+    if not project:
+        raise HTTPException(404, "Project not found")
+
+    # Only import cookies for hosts inside project scope. Auth material NEVER
+    # crosses scope, not even during capture.
+    allowed = list(project.allowed_domains or [])
+    from scanner_core import in_scope as _in_scope
+    kept = []
+    dropped = []
+    for c in body.cookies or []:
+        name = str(c.get("name", "")).strip()
+        value = str(c.get("value", ""))
+        # Cookie may not have a URL; check both explicit URL and each allowed domain
+        cookie_url = c.get("url")
+        if cookie_url and not _in_scope(cookie_url, allowed, []):
+            dropped.append(name)
+            continue
+        # If domain is provided, ensure it matches an allowed domain
+        c_domain = str(c.get("domain", "")).lstrip(".")
+        if c_domain:
+            def _match(d):
+                pat = str(d).lower().lstrip("*.").strip()
+                return c_domain.lower() == pat or c_domain.lower().endswith("." + pat)
+            if not any(_match(d) for d in allowed):
+                dropped.append(name)
+                continue
+        if name:
+            kept.append({"name": name, "value": value})
+
+    if not kept:
+        raise HTTPException(400, f"No in-scope cookies captured (dropped: {dropped})")
+
+    # Replace stored cookies; keep other config keys (check_url, indicators…)
+    new_cfg = dict(p.config or {})
+    new_cfg["cookies"] = kept
+    new_cfg["captured_at"] = datetime.now(timezone.utc).isoformat()
+    if body.final_url:
+        new_cfg["captured_final_url"] = body.final_url
+    p.type = "cookie"
+    p.config = new_cfg
+    db.commit(); db.refresh(p)
+    return {
+        "imported": len(kept),
+        "dropped_out_of_scope": dropped,
+        "profile": public_auth_profile(p),
+    }
+
+
 def _serialize_scan(s: Scan) -> ScanOut:
     return ScanOut(
         id=s.id, project_id=s.project_id, auth_profile_id=s.auth_profile_id,

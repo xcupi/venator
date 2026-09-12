@@ -27,7 +27,8 @@ Emergent infrastructure. Runs entirely with `docker compose up`.
 - Exports: JSON / CSV / Markdown
 - Docker Compose one-command dev environment
 - **Authenticated scanning (2026-02)**: Auth Profiles (cookie / header / bearer / basic) with per-project association, secret masking in UI & evidence & exports, "Test Authentication" endpoint, preflight session validation, in-scan auth-loss detection (401/403/login indicators), destructive-URL filter (logout/delete/…), scope-safe auth attachment, isolated browser context for validation
-- pytest suite (60 tests total: scope/URL/param/reflection/classification + redaction/auth-http/scope guard)
+- **Browser Login Capture (2026-02)**: `/api/auth-profiles/{id}/capture-token` mints a scope-locked 10-minute JWT; `scripts/capture_login.py` runs on the user's machine with Playwright headed Chromium, waits for login (URL-hint or button click), and POSTs cookies to `/api/auth-profiles/import-session` which drops out-of-scope cookies and stores the rest masked
+- pytest suite (53 tests: 20 scanner + 25 auth/redact + 8 capture-login E2E)
 
 ## Backlog / P1
 - Auth-aware crawling (login sequence)
