@@ -226,6 +226,8 @@ def guess_severity(context: str, validated: bool) -> str:
         return "medium"
     if context == "encoded":
         return "low"
+    if context == "header":
+        return "low"
     return "low"
 
 
@@ -242,14 +244,18 @@ def classify_finding(context: str, validated: bool) -> str:
       - ``csrf_token_required`` — a required CSRF token could not be refreshed;
                                 probe was not sent (no bypass attempted).
       - ``reflection_only``   — reflection was observed but the rendering
-                                context could not be determined (currently only
-                                emitted when the response body was truncated at
-                                ``SCANNER_MAX_BODY_BYTES`` before context could
-                                be classified). Kept out of ``potential``
-                                because exploitability is unknown; kept out of
-                                ``false_positive`` because the marker WAS seen.
+                                context is not a body-level XSS sink. Currently
+                                emitted for (a) body truncation before the
+                                marker could be observed (context ``unknown``),
+                                and (b) reflection into a response header
+                                (context ``header``) — a header echo is not
+                                directly executable as XSS but is recorded so
+                                a human reviewer can decide.
       - ``false_positive``    — marker was not observed in the response body,
-                                or the context is an unrecognised label.
+                                the baseline (pre-injection) response already
+                                contained the marker (so any probe hit is
+                                coincidental / server-injected), or the
+                                context is an unrecognised label.
     """
     if validated:
         return "validated"
@@ -261,8 +267,99 @@ def classify_finding(context: str, validated: bool) -> str:
         return "safely_encoded"
     if context == "unknown":
         return "reflection_only"
+    if context == "header":
+        return "reflection_only"
     # "none" or any unrecognised future context — no reflection observed.
     return "false_positive"
+
+
+# ---------- Baseline diff + header-reflection guard ----------
+
+def marker_in_header_values(headers, marker: str) -> bool:
+    """Return True if ``marker`` appears in any response-header VALUE.
+
+    Accepts either a list of ``(name, value)`` tuples (the shape returned by
+    scanner_engine._fetch) or a mapping. Multi-value headers (e.g. Set-Cookie)
+    are supported via the list-of-tuples form. Header NAMES are ignored on
+    purpose — the marker is a random-ish alphanumeric string; no legitimate
+    server would embed it in a header name. Comparison is case-sensitive
+    because the marker itself is a mixed-case token.
+    """
+    if not marker or not headers:
+        return False
+    if isinstance(headers, dict):
+        iterable = headers.items()
+    else:
+        iterable = headers
+    for _name, value in iterable:
+        if marker in (value or ""):
+            return True
+    return False
+
+
+def apply_baseline_and_header_context(
+    context: str,
+    reflected: bool,
+    truncated: bool,
+    marker: str,
+    probe_headers,
+    baseline_body,
+    baseline_headers,
+):
+    """Pure post-classification pass: fold in the pre-injection baseline and
+    detect header-only reflection. Returns ``(context, reflected)``.
+
+    Rules — applied in order:
+
+    1. **Truncation short-circuit.** If ``truncated=True`` and body reflection
+       is not established (``reflected=False``), the caller has already set
+       ``context = "unknown"``. Do not run baseline / header logic against a
+       truncated response — a header seen in a truncated prefix could still be
+       misleading, and the ``reflection_only`` (unknown) label already captures
+       the "we don't know" state. Returned unchanged.
+
+    2. **Baseline pollution.** If a baseline response is available AND the
+       marker appears in the baseline body OR any baseline header value, then
+       any subsequent probe-hit on the same URL cannot be attributed to our
+       injection (it is server-injected or coincidental). Downgrade to
+       ``("none", False)`` so ``classify_finding`` maps to ``false_positive``.
+
+    3. **Header-only reflection.** If body reflection is ``"none"`` (marker
+       genuinely not in probe body) but the marker appears in a probe response
+       header AND was NOT in a baseline header of the same URL, promote to
+       ``("header", True)``. ``classify_finding`` maps this to
+       ``reflection_only`` because a header echo is not directly executable as
+       XSS in the response body's rendering context.
+
+    4. Otherwise return input unchanged. Body-level classifications
+       (``html`` / ``attribute`` / ``javascript`` / ``encoded``) are NEVER
+       overridden by header reflection — the body signal is stronger and we
+       do not want to double-count.
+
+    Baseline is optional: when ``baseline_body is None`` (baseline was not
+    fetched, e.g. for CSRF-protected POSTs), rules 2 and 3 that require a
+    baseline naturally reduce to no-ops.
+    """
+    # Rule 1: never touch a truncated / unknown result.
+    if truncated and not reflected:
+        return context, reflected
+
+    have_baseline = baseline_body is not None
+
+    # Rule 2: baseline pollution → false positive.
+    if have_baseline:
+        if (marker in (baseline_body or "")) or marker_in_header_values(baseline_headers, marker):
+            return "none", False
+
+    # Rule 3: header-only reflection (only when body reflection is 'none').
+    if context == "none" and marker_in_header_values(probe_headers, marker):
+        # If baseline is unavailable OR baseline headers do not already echo
+        # the marker, treat as header reflection.
+        if not have_baseline or not marker_in_header_values(baseline_headers, marker):
+            return "header", True
+
+    # Rule 4: everything else unchanged.
+    return context, reflected
 
 
 # ---------- Payload building ----------

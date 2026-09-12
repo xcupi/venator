@@ -30,6 +30,7 @@ from models import Scan, Project, DiscoveredURL, Candidate, Finding, AuthProfile
 from scanner_core import (
     DEFAULT_MARKER,
     ENCODED_PROBE,
+    apply_baseline_and_header_context,
     classify_context,
     classify_finding,
     extract_csrf_values,
@@ -44,6 +45,11 @@ from auth_http import build_auth, looks_like_auth_loss, should_attach_auth
 log = logging.getLogger("scanner")
 
 DESTRUCTIVE_KEYWORDS = ("logout", "signout", "delete", "destroy", "remove")
+
+# Placeholder value used for baseline (pre-injection) probes. Chosen so that
+# it CANNOT contain the reflection marker and CANNOT trigger CSRF/tokenised
+# processing on the target. Human-readable so requests remain benign.
+BASELINE_PLACEHOLDER = "baseline"
 
 
 def _now():
@@ -237,8 +243,10 @@ async def _fetch(session: aiohttp.ClientSession, method: str, url: str,
     throttled (documented limitation — changing that would require redesigning
     aiohttp's redirect handling).
 
-    Returns (status, body, final_url, truncated). On transport errors returns
-    (0, "", str(exc), False) as before.
+    Returns ``(status, body, final_url, truncated, headers)``.
+    ``headers`` is a list of ``(name, value)`` tuples captured from the
+    final response — list form preserves multi-value headers such as
+    ``Set-Cookie``. On transport errors returns ``(0, "", str(exc), False, [])``.
     """
     hdrs = {}
     cookies = None
@@ -255,9 +263,13 @@ async def _fetch(session: aiohttp.ClientSession, method: str, url: str,
             allow_redirects=True, headers=hdrs or None, cookies=cookies,
         ) as resp:
             body, truncated = await _read_bounded(resp, MAX_BODY_BYTES)
-            return resp.status, body, str(resp.url), truncated
+            # Snapshot response headers as a list of (name, value) tuples.
+            # This preserves multi-value headers (e.g. Set-Cookie) that the
+            # baseline / header-reflection guard needs to inspect.
+            resp_headers = [(str(k), str(v)) for k, v in resp.headers.items()]
+            return resp.status, body, str(resp.url), truncated, resp_headers
     except Exception as e:
-        return 0, "", str(e), False
+        return 0, "", str(e), False, []
     finally:
         throttle.release()
 
@@ -282,7 +294,7 @@ async def _crawl(scan_id: str, allowed: list, excluded: list, target: str, cfg: 
                 continue
             seen.add(n)
 
-            status, body, final_url, truncated = await _fetch(
+            status, body, final_url, truncated, _ = await _fetch(
                 session, "GET", n, timeout=timeout,
                 auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
                 limiter=limiter,
@@ -341,8 +353,9 @@ class _ProbeOutcome:
     ONE (url, param) pair. Populated identically by all three probe helpers so
     _test_reflection can stay branch-free.
 
-    - status/body/truncated/req_dump: primary marker probe response and the
-      request-dump string recorded on the Finding.
+    - status/body/truncated/req_dump/headers: primary marker probe response
+      (headers is a list of (name, value) tuples). Used by classify_context
+      AND the header-reflection guard.
     - encoded_body/encoded_truncated: encoded-probe response used ONLY to
       demote reflections in html/attribute context to 'encoded'. Set to
       (None, False) when no encoded probe was applicable/sent.
@@ -355,10 +368,15 @@ class _ProbeOutcome:
     body: str = ""
     truncated: bool = False
     req_dump: str = ""
+    headers: list = None  # type: ignore[assignment]
     encoded_body: Optional[str] = None
     encoded_truncated: bool = False
     csrf_missing: bool = False
     csrf_refresh_failed: bool = False
+
+    def __post_init__(self):
+        if self.headers is None:
+            self.headers = []
 
 
 def _should_probe_encoding(body: str, marker: str) -> bool:
@@ -376,7 +394,7 @@ async def _probe_get(
 ) -> _ProbeOutcome:
     """GET probe: primary marker + (optional) encoded probe on the shared session."""
     q = {**other, pname: inj}
-    status, body, _, truncated = await _fetch(
+    status, body, _, truncated, resp_headers = await _fetch(
         session, "GET", base_url, params=q, timeout=timeout,
         auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
         limiter=limiter,
@@ -384,10 +402,11 @@ async def _probe_get(
     out = _ProbeOutcome(
         status=status, body=body, truncated=truncated,
         req_dump=f"GET {base_url}?{pname}={inj}",
+        headers=resp_headers,
     )
     if _should_probe_encoding(body, marker):
         q2 = {**other, pname: ENCODED_PROBE}
-        _, eb, _, et = await _fetch(
+        _, eb, _, et, _ = await _fetch(
             session, "GET", base_url, params=q2, timeout=timeout,
             auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
             limiter=limiter,
@@ -404,7 +423,7 @@ async def _probe_post_plain(
 ) -> _ProbeOutcome:
     """POST probe (no CSRF fields): primary + optional encoded probe on the shared session."""
     data = {**(hidden_fields or {}), pname: inj}
-    status, body, _, truncated = await _fetch(
+    status, body, _, truncated, resp_headers = await _fetch(
         session, "POST", url, data=data, timeout=timeout,
         auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
         limiter=limiter,
@@ -412,9 +431,10 @@ async def _probe_post_plain(
     out = _ProbeOutcome(
         status=status, body=body, truncated=truncated,
         req_dump=f"POST {url}\n" + "\n".join(f"{k}={v}" for k, v in data.items()),
+        headers=resp_headers,
     )
     if _should_probe_encoding(body, marker):
-        _, eb, _, et = await _fetch(
+        _, eb, _, et, _ = await _fetch(
             session, "POST", url,
             data={**(hidden_fields or {}), pname: ENCODED_PROBE}, timeout=timeout,
             auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
@@ -443,7 +463,7 @@ async def _probe_post_csrf(
         cookies=auth_cookies or None,
         headers={"User-Agent": "reflected-xss-hunter/1.0", **(auth_headers or {})},
     ) as csrf_session:
-        _, origin_body, _, _ = await _fetch(
+        _, origin_body, _, _, _ = await _fetch(
             csrf_session, "GET", origin_url, timeout=timeout,
             allowed_domains=allowed, limiter=limiter,
         )
@@ -452,13 +472,14 @@ async def _probe_post_csrf(
             return _ProbeOutcome(csrf_missing=True)
 
         data = {**(hidden_fields or {}), **fresh_csrf, pname: inj}
-        status, body, _, truncated = await _fetch(
+        status, body, _, truncated, resp_headers = await _fetch(
             csrf_session, "POST", url, data=data, timeout=timeout,
             allowed_domains=allowed, limiter=limiter,
         )
         out = _ProbeOutcome(
             status=status, body=body, truncated=truncated,
             req_dump=f"POST {url}\n" + "\n".join(f"{k}={v}" for k, v in data.items()),
+            headers=resp_headers,
         )
 
         # Encoded reflection probe for CSRF-protected POSTs. Same jar-session
@@ -467,7 +488,7 @@ async def _probe_post_csrf(
         # require a full fresh token set before sending; if refresh fails we
         # do NOT blind-submit.
         if _should_probe_encoding(body, marker):
-            _, origin_body2, _, _ = await _fetch(
+            _, origin_body2, _, _, _ = await _fetch(
                 csrf_session, "GET", origin_url, timeout=timeout,
                 allowed_domains=allowed, limiter=limiter,
             )
@@ -476,7 +497,7 @@ async def _probe_post_csrf(
                 out.csrf_refresh_failed = True
             else:
                 data2 = {**(hidden_fields or {}), **fresh_csrf2, pname: ENCODED_PROBE}
-                _, eb, _, et = await _fetch(
+                _, eb, _, et, _ = await _fetch(
                     csrf_session, "POST", url, data=data2, timeout=timeout,
                     allowed_domains=allowed, limiter=limiter,
                 )
@@ -553,18 +574,83 @@ def _record_probe_result(scan_id: str, url: str, method: str, pname: str,
             db.commit()
 
 
+async def _fetch_baseline_get(
+    session: aiohttp.ClientSession, base_url: str, all_query_params: list,
+    auth_headers: dict, auth_cookies: dict, allowed: list,
+    timeout: int, limiter: Optional["RequestLimiter"],
+):
+    """Fetch a neutral (pre-injection) baseline for a GET URL.
+
+    Sends the URL once with EVERY discovered query param set to
+    :data:`BASELINE_PLACEHOLDER`. Returns ``(body, headers)`` where headers is
+    the list of ``(name, value)`` tuples from :func:`_fetch`, or ``(None, [])``
+    on transport error.
+
+    One baseline per URL — not per param — so cost is O(1) requests per URL
+    regardless of param count. Same auth-scope guard, same throttling, same
+    body-size cap as any other request.
+    """
+    q = {p: BASELINE_PLACEHOLDER for p in all_query_params}
+    status, body, _, _, resp_headers = await _fetch(
+        session, "GET", base_url, params=q, timeout=timeout,
+        auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
+        limiter=limiter,
+    )
+    if status == 0:
+        return None, []
+    return body, resp_headers
+
+
+async def _fetch_baseline_post(
+    session: aiohttp.ClientSession, url: str, all_params: list,
+    hidden_fields: dict,
+    auth_headers: dict, auth_cookies: dict, allowed: list,
+    timeout: int, limiter: Optional["RequestLimiter"],
+):
+    """Fetch a neutral baseline for a POST-plain URL.
+
+    Sends the URL once with EVERY discovered form param set to
+    :data:`BASELINE_PLACEHOLDER`, preserving hidden fields. NOT called for
+    CSRF-protected POSTs (see :func:`_test_reflection` for rationale).
+    """
+    data = {**(hidden_fields or {}), **{p: BASELINE_PLACEHOLDER for p in all_params}}
+    status, body, _, _, resp_headers = await _fetch(
+        session, "POST", url, data=data, timeout=timeout,
+        auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
+        limiter=limiter,
+    )
+    if status == 0:
+        return None, []
+    return body, resp_headers
+
+
 async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                            auth_headers: dict, auth_cookies: dict, login_indicators: list,
                            limiter: Optional[RequestLimiter] = None):
     """Iterate every DiscoveredURL / param for a scan and probe for reflection.
 
-    Refactored into a linear pipeline:
+    Pipeline:
 
-        plan -> probe -> classify -> record
+        plan -> baseline (once per URL) -> probe -> classify
+             -> apply baseline + header guard -> encoded demote -> record
 
-    where ``plan`` is one of {GET, POST_PLAIN, POST_CSRF} decided by the
-    stored DiscoveredURL metadata. Each ``_probe_*`` helper returns a
-    :class:`_ProbeOutcome`; the outer loop does not branch on method again.
+    ``plan`` is one of {GET, POST_PLAIN, POST_CSRF} decided by the stored
+    DiscoveredURL metadata. Each ``_probe_*`` helper returns a
+    :class:`_ProbeOutcome` (which includes response headers) so the outer loop
+    does not branch on method for classification either.
+
+    Baseline: **one** GET / POST-plain request per URL with all discovered
+    params replaced by :data:`BASELINE_PLACEHOLDER`. Its body + headers are
+    passed to :func:`apply_baseline_and_header_context` after each param
+    probe to (a) suppress false positives when the marker appears in the
+    response independently of our injection and (b) promote reflections that
+    only appear in response headers to the ``header`` context (classified as
+    ``reflection_only`` — an echoed header is not directly executable XSS
+    but is worth recording). CSRF-protected POSTs SKIP baseline: an extra
+    origin-refetch + token-consuming POST would nearly double the CSRF
+    overhead AND POST to state-mutating endpoints an extra time, both of
+    which violate "avoid destructive/unnecessary requests".
+
     All pre-refactor invariants are preserved: same jar-backed session for
     CSRF primary + encoded probes, same encoded-probe gate
     (``classify_context in (html, attribute)``), same truncation-aware
@@ -596,9 +682,37 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
             if not params:
                 params = ["q"]
 
+            base_url_for_get = url.split("?", 1)[0]
+
+            # Collect the FULL param set for this URL — used only to build the
+            # baseline request. For GET this must include any query params
+            # already present in the discovered URL, since those params can
+            # affect page behaviour (routing, tabs, etc.); replacing them
+            # with the placeholder gives a fair control response.
+            all_url_params: list = list(params)
+            if method == "GET" and "?" in url:
+                for k, _v in parse_qsl(url.split("?", 1)[1], keep_blank_values=True):
+                    if k not in all_url_params:
+                        all_url_params.append(k)
+
+            # Baseline: one request per URL, GET / POST-plain only. CSRF POST
+            # baseline is intentionally skipped (see docstring).
+            baseline_body = None
+            baseline_headers: list = []
+            if method == "GET":
+                baseline_body, baseline_headers = await _fetch_baseline_get(
+                    session, base_url_for_get, all_url_params,
+                    auth_headers, auth_cookies, allowed, timeout, limiter,
+                )
+            elif method == "POST" and not (csrf_fields and origin_url):
+                baseline_body, baseline_headers = await _fetch_baseline_post(
+                    session, url, params, hidden_fields,
+                    auth_headers, auth_cookies, allowed, timeout, limiter,
+                )
+
             for pname in params:
                 inj = f"pre_{marker}_post"
-                base_url = url.split("?", 1)[0] if method == "GET" else url
+                base_url = base_url_for_get if method == "GET" else url
                 other = {}
                 if method == "GET" and "?" in url:
                     for k, v in parse_qsl(url.split("?", 1)[1], keep_blank_values=True):
@@ -655,6 +769,17 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                     )
                     context = "unknown"
 
+                # Baseline diff + header-reflection guard. Pure function; may
+                # downgrade a body reflection to ("none", False) when the
+                # baseline already contained the marker (→ false_positive) or
+                # promote a header-only reflection to ("header", True)
+                # (→ reflection_only). Truncated results (context=="unknown")
+                # are passed through unchanged — see rule 1 of the helper.
+                context, reflected = apply_baseline_and_header_context(
+                    context, reflected, outcome.truncated, marker,
+                    outcome.headers, baseline_body, baseline_headers,
+                )
+
                 # Demote html/attribute reflections to 'encoded' when the
                 # encoded probe proves the target HTML-escapes the input.
                 # A truncated probe response cannot prove safe encoding —
@@ -682,7 +807,7 @@ async def _preflight_auth(target: str, allowed: list,
     if not in_scope(probe_url, allowed, []):
         return False, 0, probe_url, "check_url is outside project scope"
     async with aiohttp.ClientSession(headers={"User-Agent": "reflected-xss-hunter/1.0"}) as session:
-        status, body, final, _ = await _fetch(
+        status, body, final, _, _ = await _fetch(
             session, "GET", probe_url, timeout=timeout,
             auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
             limiter=limiter,

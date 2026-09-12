@@ -264,7 +264,7 @@ def test_size_cap_still_enforced_with_limiter(server_a, monkeypatch):
         lim = RequestLimiter(max_concurrency=2, min_delay_ms=0)
         async with aiohttp.ClientSession() as s:
             return await _fetch(s, "GET", server_a + "/big", limiter=lim, timeout=20)
-    status, body, _, truncated = _run(go())
+    status, body, _, truncated, _ = _run(go())
     assert status == 200
     assert truncated is True
     assert len(body.encode("utf-8", "ignore")) <= 64 * 1024
@@ -313,7 +313,7 @@ def test_default_limiter_covers_out_of_scan_fetch(server_a):
     async def go():
         async with aiohttp.ClientSession() as s:
             return await _fetch(s, "GET", server_a + "/fast", timeout=10)
-    status, body, _, truncated = _run(go())
+    status, body, _, truncated, _ = _run(go())
     assert status == 200 and body == "fast-ok"
     assert scanner_engine.MAX_CONCURRENCY_PER_HOST == 5  # env default
     assert scanner_engine.MIN_DELAY_MS == 0

@@ -139,11 +139,14 @@ def _run_engine(scan_id):
 # ---------------------------------------------------------------------------
 
 def test_small_response_below_limit_is_complete(httpd):
-    status, body, final_url, truncated = _get(httpd + "/small?q=hello")
+    status, body, final_url, truncated, headers = _get(httpd + "/small?q=hello")
     assert status == 200
     assert truncated is False
     assert body == "<html><body>Hello hello!</body></html>"  # complete, untruncated
     assert final_url.startswith(httpd)
+    # Phase C: _fetch now returns a 5-tuple; headers is a list of (k, v) tuples.
+    assert isinstance(headers, list)
+    assert any(k.lower() == "content-type" for k, _v in headers)
 
 
 def test_small_reflection_detection_unchanged(httpd):
@@ -164,7 +167,7 @@ def test_small_reflection_detection_unchanged(httpd):
 
 def test_oversized_response_is_truncated(httpd, monkeypatch):
     monkeypatch.setattr(scanner_engine, "MAX_BODY_BYTES", 64 * 1024)
-    status, body, _, truncated = _get(httpd + "/big")  # 2 MiB body
+    status, body, _, truncated, _ = _get(httpd + "/big")  # 2 MiB body
     assert status == 200
     assert truncated is True
     # The returned body never exceeds the configured cap.
@@ -217,7 +220,7 @@ def test_marker_after_truncation_is_inconclusive_not_absent(httpd, monkeypatch):
 
 def test_limit_enforced_without_content_length(httpd, monkeypatch):
     monkeypatch.setattr(scanner_engine, "MAX_BODY_BYTES", 64 * 1024)
-    status, body, _, truncated = _get(httpd + "/no-length")  # 2 MiB, no Content-Length
+    status, body, _, truncated, _ = _get(httpd + "/no-length")  # 2 MiB, no Content-Length
     assert status == 200
     assert truncated is True
     assert len(body.encode("utf-8", "ignore")) <= 64 * 1024
