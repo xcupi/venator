@@ -17,9 +17,10 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import List, Set
+from typing import List, Optional, Set
 
 import aiohttp
+from sqlalchemy import update
 
 from db import SessionLocal
 from models import Scan, Project, DiscoveredURL, Candidate, Finding, AuthProfile
@@ -430,19 +431,65 @@ async def run_scan(scan_id: str):
                 db.commit()
 
 
+def try_claim_scan(scan_id: str) -> bool:
+    """Atomically transition a single scan QUEUED -> RUNNING.
+
+    Uses a conditional UPDATE (``WHERE id = :id AND status = 'QUEUED'``) so that
+    exactly one competing worker can win the claim: on PostgreSQL the second
+    updater blocks on the row lock and then re-evaluates the WHERE against the
+    committed row (0 rows matched); on SQLite the single-statement update is
+    atomic under the database write lock. Compatible with both supported
+    databases, no schema changes required.
+
+    The transaction is deliberately short — it commits before the caller ever
+    invokes the long-running run_scan().
+
+    Returns True iff THIS caller performed the transition.
+    """
+    with SessionLocal() as db:
+        res = db.execute(
+            update(Scan)
+            .where(Scan.id == scan_id, Scan.status == "QUEUED")
+            .values(status="RUNNING", started_at=_now())
+        )
+        db.commit()
+        return res.rowcount == 1
+
+
+def claim_next_queued_scan(max_attempts: int = 3) -> Optional[str]:
+    """Select the oldest QUEUED scan and atomically claim it.
+
+    If a competing worker wins the race for the selected candidate, the next
+    oldest QUEUED scan is tried (up to ``max_attempts``), so queued work is not
+    skipped merely because of a lost race. Returns the claimed scan id, or
+    None when no QUEUED scan could be claimed. Used identically by the
+    standalone worker and the embedded API worker.
+    """
+    for _ in range(max_attempts):
+        with SessionLocal() as db:
+            row = (
+                db.query(Scan.id)
+                .filter(Scan.status == "QUEUED")
+                .order_by(Scan.created_at.asc())
+                .first()
+            )
+            if not row:
+                return None
+            scan_id = row[0]
+        if try_claim_scan(scan_id):
+            log.info("claimed scan %s", scan_id)
+            return scan_id
+        log.debug("lost claim race for scan %s; trying next queued scan", scan_id)
+    return None
+
+
 def poll_and_run_forever(poll_interval: float = 2.0):
     """Blocking loop used by the standalone scanner worker container."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     log.info("scanner worker started, polling every %.1fs", poll_interval)
     while True:
         try:
-            with SessionLocal() as db:
-                scan = db.query(Scan).filter(Scan.status == "QUEUED").order_by(Scan.created_at.asc()).first()
-                scan_id = scan.id if scan else None
-                if scan_id:
-                    scan.status = "RUNNING"
-                    scan.started_at = _now()
-                    db.commit()
+            scan_id = claim_next_queued_scan()
             if scan_id:
                 asyncio.run(run_scan(scan_id))
             else:

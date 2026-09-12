@@ -38,7 +38,7 @@ from auth import (  # noqa: E402
     hash_password,
     verify_password,
 )
-from scanner_engine import run_scan, _preflight_auth  # noqa: E402
+from scanner_engine import run_scan, _preflight_auth, claim_next_queued_scan  # noqa: E402
 from auth_http import build_auth  # noqa: E402
 from redact import public_auth_profile, redact_text_evidence  # noqa: E402
 
@@ -75,9 +75,10 @@ async def _startup():
 async def _embedded_worker_loop():
     while True:
         try:
-            with SessionLocal() as db:
-                s = db.query(Scan).filter(Scan.status == "QUEUED").order_by(Scan.created_at.asc()).first()
-                sid = s.id if s else None
+            # Atomic claim: identical semantics to the standalone scanner worker
+            # (scanner_engine.poll_and_run_forever). Only the worker that wins the
+            # conditional QUEUED -> RUNNING update proceeds to run_scan().
+            sid = claim_next_queued_scan()
             if sid:
                 await run_scan(sid)
             else:

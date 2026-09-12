@@ -157,15 +157,59 @@
 ##           and conditional encoded probe submission. No behavior changes outside CSRF
 ##           POST branch. Classification model unchanged. Fix satisfies all requirements.
 
+##   - task: "Phase 1 Item 3 - Atomic QUEUED to RUNNING scan claiming"
+##     implemented: true
+##     working: true
+##     file: "backend/scanner_engine.py"
+##     stuck_count: 0
+##     priority: "high"
+##     needs_retesting: false
+##     status_history:
+##         -working: true
+##         -agent: "main"
+##         -comment: >
+##           Added try_claim_scan() (single conditional UPDATE WHERE id AND
+##           status='QUEUED', rowcount check) and claim_next_queued_scan()
+##           (oldest-first select + atomic claim + retry on lost race) in
+##           scanner_engine.py. Both poll_and_run_forever (standalone) and
+##           server._embedded_worker_loop now use claim_next_queued_scan and only
+##           call run_scan after a won claim. Short transactions; run_scan executes
+##           after claim commits. 10 new tests in tests/test_scan_claim.py
+##           (race, already-running, non-existent, multi-scan drain, oldest-first,
+##           worker-loop wiring for both loops). Full suite: 85 passed.
+##         -working: true
+##         -agent: "testing"
+##         -comment: >
+##           VERIFIED: All 10 tests in test_scan_claim.py passed (3.27s). Full
+##           regression suite: 85 passed (7.00s). Concurrency tests confirmed:
+##           (1) Two racing workers on one QUEUED scan → exactly one wins (True),
+##           one loses (False); winner proceeds, loser does not; scan ends RUNNING
+##           with started_at set. (2) Already-RUNNING and COMPLETED scans → claim
+##           fails, status untouched. (3) Non-existent scan id → False, no exception;
+##           empty queue → None. (4) 5 QUEUED scans drained by 2 competing threads →
+##           each claimed exactly once, all RUNNING. (5) Oldest QUEUED scan (by
+##           created_at) claimed first. (6) Both worker loops (standalone
+##           poll_and_run_forever and embedded _embedded_worker_loop) use identical
+##           claim semantics: call claim_next_queued_scan(), only invoke run_scan()
+##           after successful claim, never when claim returns None (lost race).
+##           Code review confirmed: try_claim_scan uses conditional UPDATE WHERE id
+##           AND status='QUEUED', commits before run_scan; claim_next_queued_scan
+##           retries on lost race; both loops use shared primitives; no DB session
+##           held across run_scan. Compatible with PostgreSQL (row lock + WHERE
+##           re-evaluation) and SQLite (single-statement atomicity). No schema
+##           changes. Invariant holds: for a given scan, at most one worker can
+##           transition it QUEUED → RUNNING and execute it. Fix satisfies all
+##           requirements.
+
 ## metadata:
 ##   created_by: "main_agent"
 ##   version: "1.0"
-##   test_sequence: 1
+##   test_sequence: 2
 ##   run_ui: false
 
 ## test_plan:
 ##   current_focus:
-##     - "Phase 1 Item 2 - CSRF-protected POST encoded reflection probe"
+##     - "Phase 1 Item 3 - Atomic QUEUED to RUNNING scan claiming"
 ##   stuck_tasks: []
 ##   test_all: true
 ##   test_priority: "high_first"
@@ -193,3 +237,17 @@
 ##       reuse, token refresh before encoded probe, no behavior changes outside CSRF
 ##       POST branch. Fix satisfies all requirements. Ready for main agent to summarize
 ##       and finish.
+##     -agent: "testing"
+##     -message: >
+##       Phase 1 Item 3 verification COMPLETE. All 10 tests in test_scan_claim.py
+##       passed (3.27s). Full regression suite: 85 passed (7.00s). Concurrency
+##       invariant verified: for a given scan, at most one worker can transition it
+##       QUEUED → RUNNING and execute it. Race tests proved exactly one winner per
+##       scan. Multi-scan drain proved each scan claimed exactly once. Worker-loop
+##       wiring tests proved both standalone and embedded workers use identical atomic
+##       claim semantics and only execute after successful claim. Code review
+##       confirmed: conditional UPDATE WHERE id AND status='QUEUED' with short
+##       transaction (commits before run_scan), retry logic on lost race, no DB
+##       session held across scan execution, compatible with PostgreSQL and SQLite,
+##       no schema changes. Fix satisfies all requirements. Ready for main agent to
+##       summarize and finish.
