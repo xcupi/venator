@@ -7,6 +7,7 @@ import Projects from "@/pages/Projects";
 import Scans from "@/pages/Scans";
 import ScanDetail from "@/pages/ScanDetail";
 import Findings from "@/pages/Findings";
+import AuthProfiles from "@/pages/AuthProfiles";
 import Login from "@/pages/Login";
 import { isAuthed } from "@/lib/api";
 
@@ -29,6 +30,7 @@ export default function App() {
         <Route path="/scans" element={<Protected><Shell><Scans /></Shell></Protected>} />
         <Route path="/scans/:id" element={<Protected><Shell><ScanDetail /></Shell></Protected>} />
         <Route path="/findings" element={<Protected><Shell><Findings /></Shell></Protected>} />
+        <Route path="/auth-profiles" element={<Protected><Shell><AuthProfiles /></Shell></Protected>} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </BrowserRouter>

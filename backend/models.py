@@ -41,18 +41,43 @@ class Scan(Base):
     __tablename__ = "scans"
     id = Column(String, primary_key=True, default=_uuid)
     project_id = Column(String, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    auth_profile_id = Column(String, ForeignKey("auth_profiles.id", ondelete="SET NULL"), nullable=True, index=True)
     target_url = Column(String, nullable=False)
-    status = Column(String, default="QUEUED", index=True)  # QUEUED/RUNNING/PAUSED/STOPPING/STOPPED/COMPLETED/FAILED
+    status = Column(String, default="QUEUED", index=True)  # QUEUED/RUNNING/PAUSED/STOPPING/STOPPED/COMPLETED/FAILED/AUTHENTICATION_REQUIRED
     config = Column(JSON, default=dict)                    # depth, concurrency, rate limit
-    stats = Column(JSON, default=dict)                     # urls_crawled, params_tested, candidates, findings
+    stats = Column(JSON, default=dict)                     # urls_crawled, params_tested, candidates, findings, auth_status
     error = Column(Text, default="")
     created_at = Column(DateTime, default=_now)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
 
     project = relationship("Project", back_populates="scans")
+    auth_profile = relationship("AuthProfile")
     findings = relationship("Finding", back_populates="scan", cascade="all, delete-orphan")
     urls = relationship("DiscoveredURL", back_populates="scan", cascade="all, delete-orphan")
+
+
+class AuthProfile(Base):
+    """Authentication profile — user-provided credentials only.
+
+    Config JSON shape depends on `type`:
+      cookie:  {"cookies": [{"name": "session", "value": "..."}, ...], "check_url": ".."}
+      header:  {"headers": [{"name": "X-Api", "value": "..", "sensitive": true}, ...]}
+      bearer:  {"token": "..", "header_name": "Authorization"}
+      basic:   {"username": "..", "password": ".."}
+    Common (any type):
+      check_url:         URL used by "Test Authentication"
+      login_indicators:  ["Sign in", "/login"]  -> if present in response, session invalid
+      authed_indicators: ["Sign out", "Dashboard"] -> presence indicates valid session
+    """
+    __tablename__ = "auth_profiles"
+    id = Column(String, primary_key=True, default=_uuid)
+    project_id = Column(String, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True)
+    name = Column(String, nullable=False)
+    type = Column(String, nullable=False)  # cookie|header|bearer|basic
+    enabled = Column(Boolean, default=True)
+    config = Column(JSON, default=dict)     # SECRETS — never exposed unmasked in the API
+    created_at = Column(DateTime, default=_now)
 
 
 class DiscoveredURL(Base):

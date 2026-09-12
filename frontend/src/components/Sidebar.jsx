@@ -1,11 +1,12 @@
 import React from "react";
 import { Link, useLocation } from "react-router-dom";
-import { ShieldAlert, LayoutDashboard, FolderGit2, ScanSearch, Bug, LogOut } from "lucide-react";
+import { ShieldAlert, LayoutDashboard, FolderGit2, ScanSearch, Bug, LogOut, KeyRound } from "lucide-react";
 import { logout } from "@/lib/api";
 
 const items = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard, testid: "nav-dashboard" },
   { to: "/projects", label: "Projects", icon: FolderGit2, testid: "nav-projects" },
+  { to: "/auth-profiles", label: "Auth Profiles", icon: KeyRound, testid: "nav-auth-profiles" },
   { to: "/scans", label: "Scans", icon: ScanSearch, testid: "nav-scans" },
   { to: "/findings", label: "Findings", icon: Bug, testid: "nav-findings" },
 ];

@@ -1,0 +1,27 @@
+{
+  "summary": "Tested AUTHENTICATED SCANNING feature end-to-end. Backend: /app/tests suite (45 tests) passes; new /app/backend/tests/test_auth_scan_e2e.py (9 tests) passes covering profile CRUD masking, VALID/INVALID test, out-of-scope check_url guard, authenticated scan crawling /dashboard/search & /dashboard/profile, AUTHENTICATION_REQUIRED on invalid creds, findings-evidence redaction, /logout not crawled, stats.auth_status. Existing /app/backend/tests/test_api_e2e.py (6 tests) still passes. Frontend UI E2E via Playwright: Sidebar Auth Profiles nav works, profile creation with masked cookie in list, Test button returns VALID pill, Scans page scan-auth-profile dropdown lists profiles for selected project, ScanDetail shows scan-auth-badge 'auth · VALID' with findings on /dashboard/search and /dashboard/profile and NO raw cookie leaked in the rendered page. AUTHENTICATION_REQUIRED scan status also observed in scans list. Everything green.",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/tests/test_scanner_core.py",
+    "/app/tests/test_auth.py",
+    "/app/backend/tests/test_api_e2e.py",
+    "/app/backend/tests/test_auth_scan_e2e.py",
+    "/app/test_reports/pytest/all.xml",
+    "/app/test_reports/pytest/auth_scan_e2e.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "server.py is ~460 lines and still growing; consider splitting auth-profile + scan endpoints into separate routers as it approaches the 700-line threshold.",
+    "test_auth_profile expects a JSON body even when empty; frontend already sends {} but consider making body Optional or accepting empty body to reduce client friction.",
+    "AuthProfile secret masking is verified in list output, but note masking is validated only via public_auth_profile — direct DB reads still contain raw values (expected, but ensure no future endpoint returns raw config)."
+  ],
+  "updated_files": ["/app/backend/tests/test_auth_scan_e2e.py"],
+  "success_rate": {"backend": "100% (60/60 backend tests: 45 unit + 15 API E2E)", "frontend": "100% of tested UI flows"},
+  "test_credentials": "admin@local.dev / admin123; test-target cookie value session=authed-session-token-abc123",
+  "seed_data_creation": "Created several TEST_ prefixed projects and profiles during E2E runs; UI-side created 'TEST_ui_prof_*' auth profile. These are transient test data.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "The pytest.ini in /app/backend forces `-n 2 --dist loadscope`; when running a single file use `-n 0` (NOT `-p no:xdist`). Test target Flask app at localhost:5000 must be running; endpoints /login, /dashboard, /dashboard/search, /dashboard/profile all functional. AuthProfile POST payload nests cookies/check_url/login_indicators under `config` key. /test endpoint requires JSON body (send {} minimum).",
+  "rca of the issue": "N/A — no failures. During test authoring, initial payload used flat fields (cookies/check_url) which returned 400 because server expects them nested under `config`; also /test endpoint requires JSON body. Fixed the tests, not the backend."
+}

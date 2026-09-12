@@ -30,7 +30,7 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
 from db import SessionLocal, get_db, init_db  # noqa: E402
-from models import Candidate, DiscoveredURL, Finding, Project, Scan, User  # noqa: E402,F401
+from models import AuthProfile, Candidate, DiscoveredURL, Finding, Project, Scan, User  # noqa: E402,F401
 from auth import (  # noqa: E402
     create_token,
     current_user,
@@ -38,7 +38,9 @@ from auth import (  # noqa: E402
     hash_password,
     verify_password,
 )
-from scanner_engine import run_scan  # noqa: E402
+from scanner_engine import run_scan, _preflight_auth  # noqa: E402
+from auth_http import build_auth  # noqa: E402
+from redact import public_auth_profile, redact_text_evidence  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("api")
@@ -113,11 +115,13 @@ class ScanIn(BaseModel):
     max_urls: int = 100
     max_depth: int = 3
     request_timeout: int = 15
+    auth_profile_id: Optional[str] = None
 
 
 class ScanOut(BaseModel):
     id: str
     project_id: str
+    auth_profile_id: Optional[str] = None
     target_url: str
     status: str
     stats: dict
@@ -212,10 +216,98 @@ def delete_project(project_id: str, user: User = Depends(current_user), db: Sess
     return {"deleted": project_id}
 
 
+# ---------- Auth Profiles ----------
+class AuthProfileIn(BaseModel):
+    project_id: str
+    name: str
+    type: str  # cookie|header|bearer|basic
+    enabled: bool = True
+    config: dict = Field(default_factory=dict)
+
+
+@api.get("/auth-profiles")
+def list_auth_profiles(project_id: Optional[str] = None,
+                        user: User = Depends(current_user), db: Session = Depends(get_db)):
+    q = db.query(AuthProfile)
+    if project_id:
+        q = q.filter(AuthProfile.project_id == project_id)
+    return [public_auth_profile(p) for p in q.order_by(AuthProfile.created_at.desc()).all()]
+
+
+@api.post("/auth-profiles")
+def create_auth_profile(body: AuthProfileIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    if body.type not in ("cookie", "header", "bearer", "basic"):
+        raise HTTPException(400, "type must be cookie|header|bearer|basic")
+    if not db.query(Project).filter(Project.id == body.project_id).first():
+        raise HTTPException(404, "Project not found")
+    p = AuthProfile(project_id=body.project_id, name=body.name, type=body.type,
+                    enabled=body.enabled, config=body.config or {})
+    db.add(p); db.commit(); db.refresh(p)
+    return public_auth_profile(p)
+
+
+@api.put("/auth-profiles/{profile_id}")
+def update_auth_profile(profile_id: str, body: AuthProfileIn,
+                        user: User = Depends(current_user), db: Session = Depends(get_db)):
+    p = db.query(AuthProfile).filter(AuthProfile.id == profile_id).first()
+    if not p:
+        raise HTTPException(404, "Auth profile not found")
+    p.name = body.name
+    p.type = body.type
+    p.enabled = body.enabled
+    p.config = body.config or {}
+    db.commit(); db.refresh(p)
+    return public_auth_profile(p)
+
+
+@api.delete("/auth-profiles/{profile_id}")
+def delete_auth_profile(profile_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    p = db.query(AuthProfile).filter(AuthProfile.id == profile_id).first()
+    if not p:
+        raise HTTPException(404, "Auth profile not found")
+    db.delete(p); db.commit()
+    return {"deleted": profile_id}
+
+
+class TestAuthIn(BaseModel):
+    check_url: Optional[str] = None  # override profile.check_url
+
+
+@api.post("/auth-profiles/{profile_id}/test")
+async def test_auth_profile(profile_id: str, body: TestAuthIn,
+                             user: User = Depends(current_user), db: Session = Depends(get_db)):
+    p = db.query(AuthProfile).filter(AuthProfile.id == profile_id).first()
+    if not p:
+        raise HTTPException(404, "Auth profile not found")
+    project = db.query(Project).filter(Project.id == p.project_id).first()
+    if not project:
+        raise HTTPException(404, "Project not found")
+    allowed = list(project.allowed_domains or [])
+    headers, cookies = build_auth(p)
+    cfg = p.config or {}
+    check_url = body.check_url or cfg.get("check_url")
+    if not check_url:
+        raise HTTPException(400, "Provide a check_url (either in the profile config or in the request)")
+    login_indicators = list(cfg.get("login_indicators", []))
+    valid, status_code, final_url, notes = await _preflight_auth(
+        target=check_url, allowed=allowed,
+        auth_headers=headers, auth_cookies=cookies,
+        check_url=check_url, login_indicators=login_indicators, timeout=15,
+    )
+    return {
+        "status": "VALID" if valid else "INVALID",
+        "http_status": status_code,
+        "final_url": final_url,
+        "notes": notes,
+        "cookies_attached": len(cookies),
+        "headers_attached": len(headers),
+    }
+
+
 def _serialize_scan(s: Scan) -> ScanOut:
     return ScanOut(
-        id=s.id, project_id=s.project_id, target_url=s.target_url,
-        status=s.status, stats=s.stats or {}, error=s.error or "",
+        id=s.id, project_id=s.project_id, auth_profile_id=s.auth_profile_id,
+        target_url=s.target_url, status=s.status, stats=s.stats or {}, error=s.error or "",
         created_at=s.created_at, started_at=s.started_at, completed_at=s.completed_at,
     )
 
@@ -225,8 +317,16 @@ def create_scan(body: ScanIn, user: User = Depends(current_user), db: Session = 
     project = db.query(Project).filter(Project.id == body.project_id).first()
     if not project:
         raise HTTPException(404, "Project not found")
+    if body.auth_profile_id:
+        prof = db.query(AuthProfile).filter(
+            AuthProfile.id == body.auth_profile_id,
+            AuthProfile.project_id == body.project_id,
+        ).first()
+        if not prof:
+            raise HTTPException(400, "auth_profile_id does not belong to this project")
     s = Scan(
-        project_id=body.project_id, target_url=body.target_url, status="QUEUED",
+        project_id=body.project_id, auth_profile_id=body.auth_profile_id,
+        target_url=body.target_url, status="QUEUED",
         config={"max_urls": body.max_urls, "max_depth": body.max_depth, "request_timeout": body.request_timeout},
         stats={},
     )
@@ -277,8 +377,9 @@ def _serialize_finding(f: Finding) -> FindingOut:
         id=f.id, scan_id=f.scan_id, url=f.url, method=f.method, param=f.param,
         context=f.context, classification=f.classification, severity=f.severity,
         payload=f.payload or "", evidence=f.evidence or "", validated=f.validated,
-        created_at=f.created_at, response_snippet=f.response_snippet or "",
-        request_dump=f.request_dump or "",
+        created_at=f.created_at,
+        response_snippet=redact_text_evidence(f.response_snippet or ""),
+        request_dump=redact_text_evidence(f.request_dump or ""),
     )
 
 

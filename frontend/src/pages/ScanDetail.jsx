@@ -46,9 +46,16 @@ export default function ScanDetail() {
       <div className="flex items-start justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold mt-1 break-all">{scan.target_url}</h1>
-          <div className="text-xs text-zinc-500 mt-1">
-            status <span className="text-emerald-400">{scan.status}</span> · created {new Date(scan.created_at).toLocaleString()}
+          <div className="text-xs text-zinc-500 mt-1 flex items-center gap-3">
+            <span>status <span className="text-emerald-400">{scan.status}</span></span>
+            <span>· created {new Date(scan.created_at).toLocaleString()}</span>
+            {scan.auth_profile_id && (
+              <span data-testid="scan-auth-badge" className="text-fuchsia-300 border border-fuchsia-500/40 rounded px-2 py-0.5">
+                auth · {scan.stats?.auth_status || "n/a"}
+              </span>
+            )}
           </div>
+          {scan.error && <div data-testid="scan-error" className="mt-2 text-xs text-red-400 max-w-2xl">{scan.error}</div>}
         </div>
         <div className="flex gap-2">
           <button data-testid="export-json" onClick={() => doExport("json")} className="text-xs px-3 py-2 rounded border border-zinc-700 hover:border-emerald-500 hover:text-emerald-300 flex items-center gap-1"><Download size={12} /> JSON</button>

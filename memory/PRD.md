@@ -17,16 +17,17 @@ Emergent infrastructure. Runs entirely with `docker compose up`.
 
 ## Core requirements implemented (2026-02)
 - CRUD projects with `allowed_domains` + `excluded_paths` scope
-- Scan lifecycle (QUEUED / RUNNING / PAUSED / STOPPING / STOPPED / COMPLETED / FAILED)
+- Scan lifecycle (QUEUED / RUNNING / PAUSED / STOPPING / STOPPED / COMPLETED / FAILED / AUTHENTICATION_REQUIRED)
 - Crawler with URL normalization, dedup, depth+URL limits, scope enforcement
 - GET + form (POST) parameter discovery
 - Reflection detection with context classification (html/attribute/javascript/encoded/none)
 - Finding classification (reflection_only / safely_encoded / potential / validated / false_positive)
-- Playwright browser validation upgrades findings to `validated`
+- Playwright browser validation upgrades findings to `validated`, ISOLATED context per candidate
 - Dashboard, scan detail w/ evidence inspector, findings table
 - Exports: JSON / CSV / Markdown
 - Docker Compose one-command dev environment
-- pytest suite (scope, URL processing, param discovery, reflection, classification)
+- **Authenticated scanning (2026-02)**: Auth Profiles (cookie / header / bearer / basic) with per-project association, secret masking in UI & evidence & exports, "Test Authentication" endpoint, preflight session validation, in-scan auth-loss detection (401/403/login indicators), destructive-URL filter (logout/delete/…), scope-safe auth attachment, isolated browser context for validation
+- pytest suite (60 tests total: scope/URL/param/reflection/classification + redaction/auth-http/scope guard)
 
 ## Backlog / P1
 - Auth-aware crawling (login sequence)

@@ -11,17 +11,20 @@ const statusColor = (s) => ({
   STOPPED: "text-zinc-400 border-zinc-700",
   COMPLETED: "text-emerald-300 border-emerald-500/40",
   FAILED: "text-red-300 border-red-500/40",
+  AUTHENTICATION_REQUIRED: "text-fuchsia-300 border-fuchsia-500/40",
 }[s] || "text-zinc-400 border-zinc-700");
 
 export default function Scans() {
   const [projects, setProjects] = useState([]);
   const [scans, setScans] = useState([]);
-  const [form, setForm] = useState({ project_id: "", target_url: "", max_urls: 100, max_depth: 3 });
+  const [authProfiles, setAuthProfiles] = useState([]);
+  const [form, setForm] = useState({ project_id: "", target_url: "", max_urls: 100, max_depth: 3, auth_profile_id: "" });
 
   const load = async () => {
-    const [p, s] = await Promise.all([api.get("/projects"), api.get("/scans")]);
+    const [p, s, a] = await Promise.all([api.get("/projects"), api.get("/scans"), api.get("/auth-profiles")]);
     setProjects(p.data);
     setScans(s.data);
+    setAuthProfiles(a.data);
     if (!form.project_id && p.data[0]) setForm((f) => ({ ...f, project_id: p.data[0].id }));
   };
   useEffect(() => { load().catch(() => {}); }, []);
@@ -37,6 +40,7 @@ export default function Scans() {
       target_url: form.target_url,
       max_urls: Number(form.max_urls),
       max_depth: Number(form.max_depth),
+      auth_profile_id: form.auth_profile_id || null,
     });
     setForm({ ...form, target_url: "" });
     load();
@@ -52,12 +56,12 @@ export default function Scans() {
       <div className="text-xs text-zinc-500 tracking-widest">// RECON</div>
       <h1 className="text-3xl font-bold mt-1 mb-6">Scans</h1>
 
-      <form onSubmit={create} className="grid md:grid-cols-5 gap-3 mb-8 border border-zinc-800 rounded-lg p-5 bg-zinc-900/40">
+      <form onSubmit={create} className="grid md:grid-cols-6 gap-3 mb-8 border border-zinc-800 rounded-lg p-5 bg-zinc-900/40">
         <select
           data-testid="scan-project"
           className="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 text-sm"
           value={form.project_id}
-          onChange={(e) => setForm({ ...form, project_id: e.target.value })}
+          onChange={(e) => setForm({ ...form, project_id: e.target.value, auth_profile_id: "" })}
           required
         >
           <option value="">Select project…</option>
@@ -71,6 +75,17 @@ export default function Scans() {
           onChange={(e) => setForm({ ...form, target_url: e.target.value })}
           required
         />
+        <select
+          data-testid="scan-auth-profile"
+          className="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 text-sm"
+          value={form.auth_profile_id}
+          onChange={(e) => setForm({ ...form, auth_profile_id: e.target.value })}
+        >
+          <option value="">(no auth)</option>
+          {authProfiles.filter((a) => a.project_id === form.project_id && a.enabled).map((a) => (
+            <option key={a.id} value={a.id}>{a.name} ({a.type})</option>
+          ))}
+        </select>
         <input
           data-testid="scan-max-urls" type="number" min={1}
           className="bg-zinc-950 border border-zinc-800 rounded px-3 py-2 text-sm"
