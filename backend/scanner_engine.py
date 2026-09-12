@@ -16,8 +16,10 @@ import asyncio
 import logging
 import os
 import time
+import weakref
 from datetime import datetime, timezone
 from typing import List, Optional, Set, Tuple
+from urllib.parse import urlsplit
 
 import aiohttp
 from sqlalchemy import update
@@ -73,6 +75,119 @@ def _finding_exists(db, scan_id: str, url: str, method: str, param: str, context
 MAX_BODY_BYTES = max(1024, int(os.environ.get("SCANNER_MAX_BODY_BYTES", str(5 * 1024 * 1024))))
 
 
+def _env_int(name: str, default: int, floor: int) -> int:
+    """Parse an int env var, normalized to >= floor. Invalid values fall back
+    to the default with a warning — never to an unlimited/disabled setting."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(floor, int(raw))
+    except ValueError:
+        log.warning("invalid %s=%r; using default %d", name, raw, default)
+        return default
+
+
+# Per-host request governance (Phase 2). Defaults keep existing functional
+# behavior: 5 concurrent requests per host, no artificial delay.
+MAX_CONCURRENCY_PER_HOST = _env_int("SCANNER_MAX_CONCURRENCY_PER_HOST", 5, 1)
+MIN_DELAY_MS = _env_int("SCANNER_MIN_DELAY_MS", 0, 0)
+
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+class _HostThrottle:
+    """Concurrency slot + start-pacing state for ONE authority."""
+
+    __slots__ = ("sem", "delay", "pace_lock", "last_start")
+
+    def __init__(self, max_concurrency: int, delay: float):
+        self.sem = asyncio.Semaphore(max_concurrency)
+        self.delay = delay
+        self.pace_lock = asyncio.Lock()
+        self.last_start = 0.0
+
+    async def acquire(self):
+        await self.sem.acquire()
+        if self.delay > 0:
+            # Serialize request STARTS for this host so they are spaced by at
+            # least `delay` seconds. The concurrency slot stays held during
+            # pacing, the request, and body consumption.
+            async with self.pace_lock:
+                now = time.monotonic()
+                wait = self.last_start + self.delay - now
+                if wait > 0:
+                    await asyncio.sleep(wait)
+                self.last_start = time.monotonic()
+
+    def release(self):
+        self.sem.release()
+
+
+class RequestLimiter:
+    """In-process per-authority request limiter, scoped to a single scan.
+
+    - max_concurrency: max simultaneous in-flight requests per authority (>= 1).
+    - min_delay_ms:    minimum milliseconds between request STARTS per
+                       authority (>= 0; 0 disables pacing).
+
+    The per-host registry lives and dies with the owning scan, so state cannot
+    accumulate across scans. Invalid values are normalized (never unlimited).
+    """
+
+    def __init__(self, max_concurrency: int = 5, min_delay_ms: int = 0):
+        try:
+            self._max = max(1, int(max_concurrency))
+        except (TypeError, ValueError):
+            log.warning("invalid max_concurrency=%r; normalized to 1", max_concurrency)
+            self._max = 1
+        try:
+            self._delay = max(0.0, float(min_delay_ms) / 1000.0)
+        except (TypeError, ValueError):
+            log.warning("invalid min_delay_ms=%r; normalized to 0", min_delay_ms)
+            self._delay = 0.0
+        self._hosts: dict = {}
+
+    @staticmethod
+    def authority_for(url: str) -> str:
+        """Host identity: scheme + hostname + effective port (default ports
+        normalized, so http://h == http://h:80 but https://h:8443 differs)."""
+        try:
+            p = urlsplit(url)
+            scheme = (p.scheme or "http").lower()
+            host = (p.hostname or "unknown").lower()
+            try:
+                port = p.port or _DEFAULT_PORTS.get(scheme, 0)
+            except ValueError:
+                port = _DEFAULT_PORTS.get(scheme, 0)
+            return f"{scheme}://{host}:{port}"
+        except Exception:
+            return "unknown://unknown:0"
+
+    def for_url(self, url: str) -> _HostThrottle:
+        key = self.authority_for(url)
+        th = self._hosts.get(key)
+        if th is None:
+            th = _HostThrottle(self._max, self._delay)
+            self._hosts[key] = th
+        return th
+
+
+# Fallback limiter for _fetch calls that run OUTSIDE a scan context (e.g. the
+# Test-Authentication endpoint). One instance per event loop: asyncio
+# primitives must not be shared across loops, and entries die with their loop.
+_DEFAULT_LIMITERS: "weakref.WeakKeyDictionary" = weakref.WeakKeyDictionary()
+
+
+def _get_default_limiter() -> RequestLimiter:
+    loop = asyncio.get_running_loop()
+    lim = _DEFAULT_LIMITERS.get(loop)
+    if lim is None:
+        lim = RequestLimiter(MAX_CONCURRENCY_PER_HOST, MIN_DELAY_MS)
+        _DEFAULT_LIMITERS[loop] = lim
+    return lim
+
+
 async def _read_bounded(resp: aiohttp.ClientResponse, limit: int) -> Tuple[str, bool]:
     """Read a response body incrementally, capped at ``limit`` bytes.
 
@@ -94,17 +209,32 @@ async def _read_bounded(resp: aiohttp.ClientResponse, limit: int) -> Tuple[str, 
             truncated = True
             break
         buf.extend(chunk)
-    # resp.get_encoding() matches the decoding semantics of resp.text()
-    return bytes(buf).decode(resp.get_encoding(), errors="ignore"), truncated
+    # Match resp.text() decoding when a charset is declared. When it is not,
+    # aiohttp's chardet fallback requires resp._body, which incremental reads
+    # never populate — fall back to utf-8 in that case.
+    try:
+        encoding = resp.get_encoding()
+    except Exception:
+        encoding = resp.charset or "utf-8"
+    return bytes(buf).decode(encoding, errors="ignore"), truncated
 
 
 async def _fetch(session: aiohttp.ClientSession, method: str, url: str,
                  params=None, data=None, timeout: int = 15,
-                 auth_headers=None, auth_cookies=None, allowed_domains=None):
+                 auth_headers=None, auth_cookies=None, allowed_domains=None,
+                 limiter: Optional[RequestLimiter] = None):
     """Scope-safe HTTP fetch. Never attaches auth to out-of-scope hosts.
 
-    The response body is streamed and capped at MAX_BODY_BYTES (env
-    SCANNER_MAX_BODY_BYTES, default 5 MiB) of decompressed content.
+    Every request passes through the per-authority limiter (scan-scoped, or the
+    per-loop default outside scan context): acquire a concurrency slot, pace the
+    request start if configured, perform the request, consume the bounded body,
+    then release the slot — including on exceptions, so a failed request can
+    never permanently exhaust a host's slots.
+
+    Redirects: aiohttp follows redirects internally; the limiter keys on the
+    INITIAL request URL. Intermediate redirect targets are not separately
+    throttled (documented limitation — changing that would require redesigning
+    aiohttp's redirect handling).
 
     Returns (status, body, final_url, truncated). On transport errors returns
     (0, "", str(exc), False) as before.
@@ -116,6 +246,8 @@ async def _fetch(session: aiohttp.ClientSession, method: str, url: str,
             hdrs.update(auth_headers or {})
             if auth_cookies:
                 cookies = dict(auth_cookies)
+    throttle = (limiter or _get_default_limiter()).for_url(url)
+    await throttle.acquire()
     try:
         async with session.request(
             method, url, params=params, data=data, timeout=timeout,
@@ -125,10 +257,13 @@ async def _fetch(session: aiohttp.ClientSession, method: str, url: str,
             return resp.status, body, str(resp.url), truncated
     except Exception as e:
         return 0, "", str(e), False
+    finally:
+        throttle.release()
 
 
 async def _crawl(scan_id: str, allowed: list, excluded: list, target: str, cfg: dict,
-                 auth_headers: dict, auth_cookies: dict, login_indicators: list):
+                 auth_headers: dict, auth_cookies: dict, login_indicators: list,
+                 limiter: Optional[RequestLimiter] = None):
     """BFS crawl within scope. Persists discovered URLs (+ form param targets)."""
     max_urls = int(cfg.get("max_urls", 100))
     max_depth = int(cfg.get("max_depth", 3))
@@ -149,6 +284,7 @@ async def _crawl(scan_id: str, allowed: list, excluded: list, target: str, cfg: 
             status, body, final_url, truncated = await _fetch(
                 session, "GET", n, timeout=timeout,
                 auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
+                limiter=limiter,
             )
             if status == 0:
                 continue
@@ -199,7 +335,8 @@ async def _crawl(scan_id: str, allowed: list, excluded: list, target: str, cfg: 
 
 
 async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
-                           auth_headers: dict, auth_cookies: dict, login_indicators: list):
+                           auth_headers: dict, auth_cookies: dict, login_indicators: list,
+                           limiter: Optional[RequestLimiter] = None):
     timeout = int(cfg.get("request_timeout", 15))
     marker = DEFAULT_MARKER
 
@@ -252,7 +389,7 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                     ) as csrf_session:
                         _, origin_body, _, _ = await _fetch(
                             csrf_session, "GET", origin_url, timeout=timeout,
-                            allowed_domains=allowed,
+                            allowed_domains=allowed, limiter=limiter,
                         )
                         fresh_csrf = extract_csrf_values(origin_body, csrf_fields)
                         if not fresh_csrf or any(not fresh_csrf.get(n) for n in csrf_fields):
@@ -262,7 +399,7 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                             data = {**(hidden_fields or {}), **fresh_csrf, pname: inj}
                             status, body, _, truncated = await _fetch(
                                 csrf_session, "POST", url, data=data, timeout=timeout,
-                                allowed_domains=allowed,
+                                allowed_domains=allowed, limiter=limiter,
                             )
                             req_dump = f"POST {url}\n" + "\n".join(f"{k}={v}" for k, v in data.items())
 
@@ -277,7 +414,7 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                             if body and classify_context(body, marker) in ("html", "attribute"):
                                 _, origin_body2, _, _ = await _fetch(
                                     csrf_session, "GET", origin_url, timeout=timeout,
-                                    allowed_domains=allowed,
+                                    allowed_domains=allowed, limiter=limiter,
                                 )
                                 fresh_csrf2 = extract_csrf_values(origin_body2, csrf_fields)
                                 if not fresh_csrf2 or any(not fresh_csrf2.get(n) for n in csrf_fields):
@@ -286,7 +423,7 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                                     data2 = {**(hidden_fields or {}), **fresh_csrf2, pname: ENCODED_PROBE}
                                     _, body2, _, truncated2 = await _fetch(
                                         csrf_session, "POST", url, data=data2, timeout=timeout,
-                                        allowed_domains=allowed,
+                                        allowed_domains=allowed, limiter=limiter,
                                     )
                     if csrf_missing or csrf_refresh_failed:
                         with SessionLocal() as db:
@@ -314,6 +451,7 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                     status, body, _, truncated = await _fetch(
                         session, "GET", base_url, params=q, timeout=timeout,
                         auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
+                        limiter=limiter,
                     )
                     req_dump = f"GET {base_url}?{pname}={inj}"
                 else:
@@ -322,6 +460,7 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                     status, body, _, truncated = await _fetch(
                         session, "POST", url, data=data, timeout=timeout,
                         auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
+                        limiter=limiter,
                     )
                     req_dump = f"POST {url}\n" + "\n".join(f"{k}={v}" for k, v in data.items())
 
@@ -352,12 +491,14 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                         _, body2, _, truncated2 = await _fetch(
                             session, "GET", base_url, params=q2, timeout=timeout,
                             auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
+                            limiter=limiter,
                         )
                     elif method == "POST" and not csrf_fields:
                         _, body2, _, truncated2 = await _fetch(
                             session, "POST", url, data={**(hidden_fields or {}), pname: probe},
                             timeout=timeout,
                             auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
+                            limiter=limiter,
                         )
                     # CSRF-protected POST: the encoded probe already ran above inside the
                     # isolated cookie-jar session with a refreshed token; body2 holds its
@@ -398,7 +539,8 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
 
 async def _preflight_auth(target: str, allowed: list,
                           auth_headers: dict, auth_cookies: dict,
-                          check_url: str, login_indicators: list, timeout: int) -> tuple:
+                          check_url: str, login_indicators: list, timeout: int,
+                          limiter: Optional[RequestLimiter] = None) -> tuple:
     """Return (valid: bool, status: int, final_url: str, notes: str)."""
     probe_url = check_url or target
     if not in_scope(probe_url, allowed, []):
@@ -407,6 +549,7 @@ async def _preflight_auth(target: str, allowed: list,
         status, body, final, _ = await _fetch(
             session, "GET", probe_url, timeout=timeout,
             auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
+            limiter=limiter,
         )
     if status == 0:
         return False, 0, probe_url, "network error"
@@ -441,6 +584,13 @@ async def run_scan(scan_id: str):
         auth_headers, auth_cookies = build_auth(profile) if profile else ({}, {})
         login_indicators = list((profile.config or {}).get("login_indicators", [])) if profile else []
         check_url = (profile.config or {}).get("check_url") if profile else None
+        # Per-scan request governance: per-authority concurrency cap + optional
+        # pacing. Per-scan config keys override the process env defaults; the
+        # limiter registry lives only for the duration of this scan.
+        limiter = RequestLimiter(
+            max_concurrency=cfg.get("max_concurrency_per_host", MAX_CONCURRENCY_PER_HOST),
+            min_delay_ms=cfg.get("min_delay_ms", MIN_DELAY_MS),
+        )
 
     try:
         # Session preflight when auth is configured
@@ -448,6 +598,7 @@ async def run_scan(scan_id: str):
             valid, status, final, notes = await _preflight_auth(
                 target, allowed, auth_headers, auth_cookies,
                 check_url, login_indicators, int(cfg.get("request_timeout", 15)),
+                limiter=limiter,
             )
             with SessionLocal() as db:
                 s = db.query(Scan).filter(Scan.id == scan_id).first()
@@ -457,9 +608,9 @@ async def run_scan(scan_id: str):
                 raise AuthLostError(f"Preflight failed ({notes}, status {status}, final {final})")
 
         await _crawl(scan_id, allowed, excluded, target, cfg,
-                     auth_headers, auth_cookies, login_indicators)
+                     auth_headers, auth_cookies, login_indicators, limiter=limiter)
         await _test_reflection(scan_id, cfg, allowed,
-                               auth_headers, auth_cookies, login_indicators)
+                               auth_headers, auth_cookies, login_indicators, limiter=limiter)
         with SessionLocal() as db:
             s = db.query(Scan).filter(Scan.id == scan_id).first()
             if s.status == "STOPPING":

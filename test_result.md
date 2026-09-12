@@ -157,6 +157,71 @@
 ##           and conditional encoded probe submission. No behavior changes outside CSRF
 ##           POST branch. Classification model unchanged. Fix satisfies all requirements.
 
+##   - task: "Phase 2 Item 5 - Per-host concurrency and request throttling"
+##     implemented: true
+##     working: true
+##     file: "backend/scanner_engine.py"
+##     stuck_count: 0
+##     priority: "high"
+##     needs_retesting: false
+##     status_history:
+##         -working: true
+##         -agent: "main"
+##         -comment: >
+##           RequestLimiter (per-authority asyncio semaphore + start pacing) keyed
+##           by scheme://host:effective-port (default ports normalized). Scan-scoped
+##           instance created in run_scan (per-scan overrides via scan config keys
+##           max_concurrency_per_host / min_delay_ms); per-event-loop default
+##           limiter covers out-of-scan _fetch callers. _fetch acquires slot before
+##           the request, holds it through bounded body consumption, releases in
+##           finally. Env: SCANNER_MAX_CONCURRENCY_PER_HOST (default 5),
+##           SCANNER_MIN_DELAY_MS (default 0); invalid values normalized (never
+##           unlimited). Also fixed latent Item-4 decoding bug: get_encoding()
+##           raised on charset-less streamed bodies; now falls back to declared
+##           charset or utf-8. 10 new tests in tests/test_throttle.py. Full suite:
+##           103 passed.
+##         -working: true
+##         -agent: "testing"
+##         -comment: >
+##           VERIFIED: All 10 tests in test_throttle.py passed (2.33s). Full
+##           regression suite: 103 passed (13.13s). Tests confirmed all
+##           requirements: (1) Per-host concurrency cap enforced (5 concurrent
+##           /slow requests with cap=2 → server-observed max concurrency exactly
+##           2); (2) Different hosts progress independently (cap=1 per host,
+##           concurrent /slow to both hosts → server-side intervals overlap,
+##           proving no global serialization); (3) Min delay spaces request starts
+##           (min_delay_ms=100, 3 requests → server receipt gaps >= ~85ms); (4)
+##           Delay is per host (250ms delay on host A does NOT delay first request
+##           to host B, < 150ms); (5) Failed request releases slot (/boom
+##           connection dropped with cap=1 → status 0, subsequent request still
+##           acquires slot and succeeds); (6) Item 4 size cap still enforced with
+##           limiter active (2 MiB body, 64 KiB cap → truncated, body <= cap); (7)
+##           Authority normalization (http:80 normalized, https:8443 distinct, host
+##           case-insensitive); (8) Config normalization (0 → 1, negative → 0,
+##           bogus strings → defaults, never unlimited); (9) Env int helper
+##           validation; (10) Default limiter covers out-of-scan _fetch calls.
+##           Code review confirmed: RequestLimiter class (lines 127-174) correctly
+##           implements per-authority semaphore + start pacing with authority
+##           normalization (scheme://host:effective-port, default ports 80/443
+##           normalized); _HostThrottle (lines 99-124) correctly implements
+##           concurrency slot + start pacing (pacing only delays STARTS, not entire
+##           request duration); _fetch (lines 222-262) acquires throttle slot
+##           BEFORE request, holds through bounded body consumption, releases in
+##           finally (exception-safe); all 10 _fetch call sites correctly pass
+##           limiter parameter; run_scan (lines 590-593) creates scan-scoped
+##           RequestLimiter with per-scan config overrides, passes to _crawl,
+##           _test_reflection, _preflight_auth; per-event-loop default limiter
+##           (lines 176-188) uses weakref.WeakKeyDictionary so asyncio primitives
+##           never bind across loops and entries die with their loop; bug fix
+##           (lines 215-218) correctly handles get_encoding() raising on
+##           charset-less streamed bodies by falling back to declared charset or
+##           utf-8. Pre-existing test failures in /app/backend/tests/ (collection
+##           error requiring REACT_APP_BACKEND_URL) unrelated to this change. Fix
+##           satisfies all requirements: per-authority concurrency cap (never
+##           unlimited), per-authority start spacing, independence across hosts,
+##           exception safety, size-cap preserved, scan-scoped limiter (no
+##           unbounded growth), per-loop default for out-of-scan calls.
+
 ##   - task: "Phase 1 Item 4 - HTTP response body size protection"
 ##     implemented: true
 ##     working: true
@@ -260,7 +325,7 @@
 
 ## test_plan:
 ##   current_focus:
-##     - "Phase 1 Item 4 - HTTP response body size protection"
+##     - "Phase 2 Item 5 - Per-host concurrency and request throttling"
 ##   stuck_tasks: []
 ##   test_all: true
 ##   test_priority: "high_first"
@@ -320,3 +385,27 @@
 ##       test fakes updated, documentation complete. Pre-existing failures in
 ##       /app/backend/tests/ unrelated (require live deployment). Fix satisfies all
 ##       requirements. Ready for main agent to summarize and finish.
+##     -agent: "testing"
+##     -message: >
+##       Phase 2 Item 5 verification COMPLETE. All 10 tests in test_throttle.py
+##       passed (2.33s). Full regression suite: 103 passed (13.13s). Tests confirmed
+##       all requirements: per-host concurrency cap enforced (server-observed max
+##       concurrency exactly matches limit), different hosts progress independently
+##       (no global serialization), min delay spaces request starts per host, delay
+##       is per host (host A pacing does not delay host B), failed request releases
+##       slot (exception-safe), Item 4 size cap still enforced with limiter active,
+##       authority normalization correct (default ports normalized, scheme matters,
+##       host case-insensitive), config normalization correct (never unlimited),
+##       default limiter covers out-of-scan _fetch calls. Code review confirmed:
+##       RequestLimiter correctly implements per-authority semaphore + start pacing
+##       with authority normalization; _HostThrottle correctly implements concurrency
+##       slot + start pacing (pacing only delays STARTS); _fetch acquires slot before
+##       request, holds through body consumption, releases in finally
+##       (exception-safe); all 10 _fetch call sites correctly pass limiter; run_scan
+##       creates scan-scoped limiter with per-scan config overrides; per-event-loop
+##       default limiter uses weakref.WeakKeyDictionary (asyncio primitives never
+##       bind across loops); bug fix correctly handles get_encoding() raising on
+##       charset-less streamed bodies. Pre-existing test failures in
+##       /app/backend/tests/ unrelated (require REACT_APP_BACKEND_URL for live
+##       deployment). Fix satisfies all requirements. Ready for main agent to
+##       summarize and finish.

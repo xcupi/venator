@@ -38,7 +38,8 @@ def _install_reflecting_fetch(monkeypatch):
     long as any query/form value contains the marker)."""
 
     async def fake_fetch(session, method, url, params=None, data=None, timeout=15,
-                        auth_headers=None, auth_cookies=None, allowed_domains=None):
+                        auth_headers=None, auth_cookies=None, allowed_domains=None,
+                        limiter=None):
         parts = []
         if params:
             parts.extend(str(v) for v in params.values())

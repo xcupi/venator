@@ -103,6 +103,8 @@ Everything is driven by `.env` (see `.env.example`). Highlights:
 | `ADMIN_EMAIL/ADMIN_PASSWORD` | Bootstrap admin created on first run             |
 | `SCANNER_MAX_URLS/DEPTH`  | Crawler bounds                                      |
 | `SCANNER_MAX_BODY_BYTES`  | Max decompressed response bytes kept per request (default 5 MiB); bodies past the cap are truncated and flagged |
+| `SCANNER_MAX_CONCURRENCY_PER_HOST` | Max simultaneous in-flight requests per authority (scheme+host+port), default 5 |
+| `SCANNER_MIN_DELAY_MS`    | Minimum milliseconds between request starts to the same authority (default 0 = disabled); per-scan overrides: `max_concurrency_per_host`, `min_delay_ms` in scan config |
 | `BROWSER_HEADLESS`        | Toggle Playwright headless mode                     |
 | `REACT_APP_BACKEND_URL`   | Backend URL baked into the frontend build           |
 

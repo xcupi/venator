@@ -190,7 +190,8 @@ def _make_fake_csrf_server(*, reflect_mode="raw", fail_refresh=False):
         return f"TOK{token_counter['n']}"
 
     async def fake_fetch(session, method, url, params=None, data=None, timeout=15,
-                        auth_headers=None, auth_cookies=None, allowed_domains=None):
+                        auth_headers=None, auth_cookies=None, allowed_domains=None,
+                        limiter=None):
         sid = id(session)
         if method == "GET" and url.endswith("/form"):
             if fail_refresh and any(e[0] == "POST" for e in log):
@@ -303,7 +304,8 @@ def test_csrf_rotation_uses_refreshed_token_in_same_session(monkeypatch):
 
 def _make_echo_fake(*, escape_values=False):
     async def fake_fetch(session, method, url, params=None, data=None, timeout=15,
-                        auth_headers=None, auth_cookies=None, allowed_domains=None):
+                        auth_headers=None, auth_cookies=None, allowed_domains=None,
+                        limiter=None):
         parts = []
         if params:
             parts.extend(str(v) for v in params.values())
