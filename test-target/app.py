@@ -3,7 +3,9 @@
 Contains BOTH public (`/search`) and authenticated (`/dashboard/search`) endpoints so
 authenticated-scan behaviour can be exercised end-to-end. Never expose to the internet.
 """
-from flask import Flask, request, make_response, redirect, session as flask_session
+import os
+
+from flask import Flask, jsonify, request, make_response, redirect, session as flask_session
 from markupsafe import escape
 import secrets
 
@@ -157,6 +159,7 @@ def csrf_form():
         supplied = request.form.get("csrf_token", "")
         if not expected or supplied != expected:
             return "<html><body>403 CSRF token invalid</body></html>", 403
+        POST_STATS["csrf_form"] += 1
         comment = request.form.get("comment", "")
         # rotate the token like most frameworks
         flask_session.pop("csrf", None)
@@ -192,5 +195,38 @@ def dashboard_csrf_search():
       </form><a href='/logout'>Sign out</a></body></html>"""
 
 
+# --- Observability for integration tests: count ACCEPTED POSTs per endpoint ---
+POST_STATS = {"csrf_form": 0, "csrf_form_encoded": 0}
+
+
+@app.get("/_stats")
+def stats():
+    return jsonify(POST_STATS)
+
+
+# --- CSRF-protected form that SAFELY ENCODES the reflected input ---
+# Same session/rotation behaviour as /csrf-form, but the comment is HTML-escaped,
+# so a correct scanner should classify this as safely_encoded, not potential.
+@app.route("/csrf-form-encoded", methods=["GET", "POST"])
+def csrf_form_encoded():
+    if request.method == "POST":
+        expected = flask_session.get("csrf", "")
+        supplied = request.form.get("csrf_token", "")
+        if not expected or supplied != expected:
+            return "<html><body>403 CSRF token invalid</body></html>", 403
+        POST_STATS["csrf_form_encoded"] += 1
+        comment = request.form.get("comment", "")
+        # rotate the token like most frameworks
+        flask_session.pop("csrf", None)
+        return f"<html><body>Posted: {escape(comment)}</body></html>"
+    tok = _issue_csrf()
+    return f"""<html><body>
+      <form method='POST' action='/csrf-form-encoded'>
+        <input type='hidden' name='csrf_token' value='{tok}'>
+        <input name='comment' value='hi'>
+        <button>Send</button>
+      </form></body></html>"""
+
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")))

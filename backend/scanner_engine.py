@@ -197,6 +197,8 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                 # into the jar and remain scoped to the target host by aiohttp.
                 fresh_csrf = {}
                 csrf_missing = False
+                csrf_refresh_failed = False
+                body2 = None  # encoded-probe response (populated per path below)
                 if method == "POST" and csrf_fields and origin_url:
                     jar = aiohttp.CookieJar(unsafe=True)
                     async with aiohttp.ClientSession(
@@ -219,22 +221,45 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                                 allowed_domains=allowed,
                             )
                             req_dump = f"POST {url}\n" + "\n".join(f"{k}={v}" for k, v in data.items())
-                            # Run the encoded-probe with a re-issued token inside the same jar
-                            _, origin_body2, _ = await _fetch(
-                                csrf_session, "GET", origin_url, timeout=timeout,
-                                allowed_domains=allowed,
-                            )
-                            fresh_csrf2 = extract_csrf_values(origin_body2, csrf_fields) or fresh_csrf
-                    if csrf_missing:
+
+                            # Encoded reflection probe for CSRF-protected POSTs. Runs inside
+                            # the SAME cookie-jar session as the primary probe so the
+                            # authenticated framework session is preserved. Frameworks commonly
+                            # rotate the token on every POST, so re-fetch the origin and
+                            # require a full fresh token set before sending the encoded probe;
+                            # if the refresh fails we do NOT blind-submit.
+                            # Gate matches the GET/non-CSRF paths: only probe when the primary
+                            # reflection landed in html/attribute context.
+                            if body and classify_context(body, marker) in ("html", "attribute"):
+                                _, origin_body2, _ = await _fetch(
+                                    csrf_session, "GET", origin_url, timeout=timeout,
+                                    allowed_domains=allowed,
+                                )
+                                fresh_csrf2 = extract_csrf_values(origin_body2, csrf_fields)
+                                if not fresh_csrf2 or any(not fresh_csrf2.get(n) for n in csrf_fields):
+                                    csrf_refresh_failed = True
+                                else:
+                                    data2 = {**(hidden_fields or {}), **fresh_csrf2, pname: ENCODED_PROBE}
+                                    _, body2, _ = await _fetch(
+                                        csrf_session, "POST", url, data=data2, timeout=timeout,
+                                        allowed_domains=allowed,
+                                    )
+                    if csrf_missing or csrf_refresh_failed:
                         with SessionLocal() as db:
                             if not _finding_exists(db, scan_id, url, method, pname, "csrf_required"):
+                                reason = (
+                                    f"required CSRF field(s) {csrf_fields} could not be refreshed from {origin_url}"
+                                    if csrf_missing else
+                                    f"CSRF token refresh at {origin_url} failed before the encoded probe; "
+                                    f"reflection confirmed by primary probe but encoding state unknown"
+                                )
                                 db.add(Finding(
                                     scan_id=scan_id, url=url, method=method, param=pname,
                                     context="csrf_required",
                                     classification=classify_finding("csrf_required", validated=False),
                                     severity="low",
                                     payload="",
-                                    evidence=f"required CSRF field(s) {csrf_fields} could not be refreshed from {origin_url}",
+                                    evidence=reason,
                                     request_dump=f"POST {url}\n(missing CSRF token: {csrf_fields})",
                                     response_snippet="",
                                 ))
@@ -279,9 +304,9 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                             timeout=timeout,
                             auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
                         )
-                    else:
-                        # CSRF-protected POST: skip encoded probe (needs fresh token in same jar)
-                        body2 = None
+                    # CSRF-protected POST: the encoded probe already ran above inside the
+                    # isolated cookie-jar session with a refreshed token; body2 holds its
+                    # response (None when the probe was not applicable/failed).
                     if body2 and probe not in body2 and ("&lt;" in body2 or "&gt;" in body2):
                         context = "encoded"
 

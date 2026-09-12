@@ -101,3 +101,95 @@
 #====================================================================================================
 # Testing Data - Main Agent and testing sub agent both should log testing data below this section
 #====================================================================================================
+
+## user_problem_statement: >
+##   Continue development of the existing "Reflected XSS Hunter" security testing tool.
+##   Phase 1, Item 2: make the encoded reflection probe work for CSRF-protected POST
+##   forms by reusing the existing isolated CSRF session/CookieJar, refreshing rotated
+##   CSRF tokens, and classifying safely-encoded reflections as safely_encoded instead
+##   of potential. Reflection alone must never be classified as confirmed XSS.
+
+## backend:
+##   - task: "Phase 1 Item 1 - Finding deduplication"
+##     implemented: true
+##     working: true
+##     file: "backend/scanner_engine.py"
+##     stuck_count: 0
+##     priority: "high"
+##     needs_retesting: false
+##     status_history:
+##         -working: true
+##         -agent: "main"
+##         -comment: "App-level dedup on (scan_id, url, method, param, context) guards both Finding insert sites in _test_reflection. 3 new tests in tests/test_finding_dedup.py; full suite 67 passed."
+##   - task: "Phase 1 Item 2 - CSRF-protected POST encoded reflection probe"
+##     implemented: true
+##     working: true
+##     file: "backend/scanner_engine.py"
+##     stuck_count: 0
+##     priority: "high"
+##     needs_retesting: false
+##     status_history:
+##         -working: true
+##         -agent: "main"
+##         -comment: >
+##           CSRF branch of _test_reflection now runs the encoded probe (ENCODED_PROBE)
+##           inside the same cookie-jar session after refreshing the (possibly rotated)
+##           CSRF token from origin_url. Refresh failure -> csrf_token_required finding,
+##           no blind submit. Encoded probe gated on primary reflection landing in
+##           html/attribute context (parity with GET path). Outer encoded-probe block now
+##           consumes body2 for CSRF POST instead of forcing None. test-target gained
+##           /csrf-form-encoded (escaping variant) + /_stats observability + env PORT.
+##           8 new tests in tests/test_csrf_encoded_probe.py (2 live E2E + 6 unit).
+##           Full suite: 75 passed.
+##         -working: true
+##         -agent: "testing"
+##         -comment: >
+##           VERIFIED: All 8 tests in test_csrf_encoded_probe.py passed (1.92s). Full
+##           suite: 75 passed (5.11s). Live E2E tests confirmed: (1) CSRF-protected POST
+##           with safe HTML encoding → safely_encoded classification, 2 accepted POSTs
+##           (primary + encoded probe with rotated token); (2) CSRF-protected POST with
+##           raw reflection → potential classification (NOT validated), 2 accepted POSTs
+##           proving token rotation handling; (3) refresh failure → csrf_token_required,
+##           exactly 1 POST (no blind encoded submit); (4) token rotation → encoded probe
+##           carries refreshed token in SAME session. Regression tests confirmed GET and
+##           non-CSRF POST behavior unchanged. Code review: scanner_engine.py lines
+##           225-311 correctly implement isolated cookie-jar session reuse, token refresh,
+##           and conditional encoded probe submission. No behavior changes outside CSRF
+##           POST branch. Classification model unchanged. Fix satisfies all requirements.
+
+## metadata:
+##   created_by: "main_agent"
+##   version: "1.0"
+##   test_sequence: 1
+##   run_ui: false
+
+## test_plan:
+##   current_focus:
+##     - "Phase 1 Item 2 - CSRF-protected POST encoded reflection probe"
+##   stuck_tasks: []
+##   test_all: true
+##   test_priority: "high_first"
+
+## agent_communication:
+##     -agent: "main"
+##     -message: >
+##       Please verify Phase 1 Item 2 (CSRF-protected POST encoded probe). Focus:
+##       (1) run tests/test_csrf_encoded_probe.py - includes 2 live E2E tests that
+##       spawn the real /app/test-target/app.py via subprocess on an ephemeral port
+##       (flask==3.0.3 was pip-installed for this); (2) run the full tests/ suite for
+##       regressions. Expected: safely-encoding CSRF POST -> safely_encoded; raw CSRF
+##       POST with rotation -> potential (never validated); refresh failure ->
+##       csrf_token_required with exactly one POST (no blind encoded submit); GET and
+##       non-CSRF POST behavior unchanged. Run with: cd /app && PYTHONPATH=/app/backend
+##       python -m pytest tests/ -n 0
+##     -agent: "testing"
+##     -message: >
+##       Phase 1 Item 2 verification COMPLETE. All 8 new tests passed, full suite 75
+##       passed (no regressions). Live E2E tests confirmed correct classification:
+##       safely-encoded CSRF POST → safely_encoded; raw CSRF POST → potential (never
+##       validated); token rotation handled correctly (2 POSTs accepted in both cases);
+##       refresh failure → csrf_token_required with exactly 1 POST (no blind submit).
+##       Code review confirmed implementation correctness: isolated cookie-jar session
+##       reuse, token refresh before encoded probe, no behavior changes outside CSRF
+##       POST branch. Fix satisfies all requirements. Ready for main agent to summarize
+##       and finish.
