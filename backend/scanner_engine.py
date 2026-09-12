@@ -50,6 +50,22 @@ class AuthLostError(RuntimeError):
     """Raised when the configured authentication session appears to have expired."""
 
 
+def _finding_exists(db, scan_id: str, url: str, method: str, param: str, context: str) -> bool:
+    """Return True if a Finding with the same (scan_id, url, method, param, context)
+    already exists. Used to prevent duplicate findings when the same reflecting
+    endpoint is reached via multiple DiscoveredURL rows (e.g. crawled through
+    several internal links). Dedup is intentionally scoped per-scan so distinct
+    scans still record independent findings for the same URL.
+    """
+    return db.query(Finding.id).filter(
+        Finding.scan_id == scan_id,
+        Finding.url == url,
+        Finding.method == method,
+        Finding.param == param,
+        Finding.context == context,
+    ).first() is not None
+
+
 async def _fetch(session: aiohttp.ClientSession, method: str, url: str,
                  params=None, data=None, timeout: int = 15,
                  auth_headers=None, auth_cookies=None, allowed_domains=None):
@@ -211,17 +227,18 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                             fresh_csrf2 = extract_csrf_values(origin_body2, csrf_fields) or fresh_csrf
                     if csrf_missing:
                         with SessionLocal() as db:
-                            db.add(Finding(
-                                scan_id=scan_id, url=url, method=method, param=pname,
-                                context="csrf_required",
-                                classification=classify_finding("csrf_required", validated=False),
-                                severity="low",
-                                payload="",
-                                evidence=f"required CSRF field(s) {csrf_fields} could not be refreshed from {origin_url}",
-                                request_dump=f"POST {url}\n(missing CSRF token: {csrf_fields})",
-                                response_snippet="",
-                            ))
-                            db.commit()
+                            if not _finding_exists(db, scan_id, url, method, pname, "csrf_required"):
+                                db.add(Finding(
+                                    scan_id=scan_id, url=url, method=method, param=pname,
+                                    context="csrf_required",
+                                    classification=classify_finding("csrf_required", validated=False),
+                                    severity="low",
+                                    payload="",
+                                    evidence=f"required CSRF field(s) {csrf_fields} could not be refreshed from {origin_url}",
+                                    request_dump=f"POST {url}\n(missing CSRF token: {csrf_fields})",
+                                    response_snippet="",
+                                ))
+                                db.commit()
                         continue
                 elif method == "GET":
                     q = {**other, pname: inj}
@@ -279,20 +296,21 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                     db.commit()
 
                     if reflected:
-                        snippet_idx = body.find(marker) if marker in body else -1
-                        snippet = body[max(0, snippet_idx - 80): snippet_idx + 160] if snippet_idx >= 0 else ""
-                        db.add(Finding(
-                            scan_id=scan_id, url=url, method=method, param=pname,
-                            context=context,
-                            classification=classify_finding(context, validated=False),
-                            severity=guess_severity(context, validated=False),
-                            payload="<probe>",
-                            evidence=f"marker reflected in {context} context",
-                            request_dump=req_dump,
-                            response_snippet=snippet,
-                        ))
-                        s.stats = {**(s.stats or {}), "candidates": (s.stats or {}).get("candidates", 0) + 1}
-                        db.commit()
+                        if not _finding_exists(db, scan_id, url, method, pname, context):
+                            snippet_idx = body.find(marker) if marker in body else -1
+                            snippet = body[max(0, snippet_idx - 80): snippet_idx + 160] if snippet_idx >= 0 else ""
+                            db.add(Finding(
+                                scan_id=scan_id, url=url, method=method, param=pname,
+                                context=context,
+                                classification=classify_finding(context, validated=False),
+                                severity=guess_severity(context, validated=False),
+                                payload="<probe>",
+                                evidence=f"marker reflected in {context} context",
+                                request_dump=req_dump,
+                                response_snippet=snippet,
+                            ))
+                            s.stats = {**(s.stats or {}), "candidates": (s.stats or {}).get("candidates", 0) + 1}
+                            db.commit()
 
 
 async def _preflight_auth(target: str, allowed: list,
