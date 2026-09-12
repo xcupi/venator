@@ -1,0 +1,149 @@
+# Reflected XSS Hunter — local, portable, Docker-first
+
+A self-contained platform for discovering reflected XSS. Everything — frontend, backend,
+scanner worker, browser validation worker, database, and an intentionally vulnerable
+test target — runs locally through Docker Compose. **No Emergent services are required.**
+
+## Architecture
+
+```
+Frontend (React + nginx)      http://localhost:3000
+        │
+        ▼
+Backend API (FastAPI)         http://localhost:8001/api
+        │
+        ▼
+PostgreSQL   ◄──────── Scanner Worker (aiohttp crawler + reflection engine)
+     │
+     └──────────────── Browser Worker (Playwright / headless Chromium)
+
+Test target (Flask, intentionally vulnerable)  http://localhost:5001
+```
+
+State — including scan progress, queued/running scans, findings and evidence — lives in
+Postgres, so long-running scans **survive browser close and container restarts**.
+
+## Quick start
+
+```bash
+git clone <your-fork>
+cd reflected-xss-hunter          # this repo
+
+cp .env.example .env
+docker compose up --build
+```
+
+Then open:
+
+- Web UI:     http://localhost:3000
+- API docs:   http://localhost:8001/docs
+- Test target http://localhost:5001
+
+Login with the bootstrap admin defined in `.env`:
+
+```
+admin@local.dev / admin123
+```
+
+Change these before use in any shared network.
+
+### Everyday commands
+
+```bash
+# tail all logs
+docker compose logs -f
+
+# stop everything
+docker compose down
+
+# nuke DB volume for a clean slate
+docker compose down -v
+
+# rebuild after code change
+docker compose up --build
+```
+
+## First scan — end-to-end
+
+1. Log in to the web UI.
+2. Create a **Project**, e.g.:
+   - Name: `local-demo`
+   - Allowed domains: `test-target`
+3. On **Scans** page, queue a scan against `http://test-target:5000/`.
+4. Watch it move through `QUEUED → RUNNING → COMPLETED`.
+5. Open the scan to inspect findings. Six reflection endpoints on the test target
+   demonstrate HTML / attribute / JavaScript / encoded / non-reflection / POST-form
+   contexts.
+6. Browser worker upgrades `potential` → `validated` when a payload triggers `alert()`.
+7. Export from the scan detail: **JSON / CSV / Markdown**.
+
+## Directory layout
+
+```
+reflected-xss-hunter/
+├── frontend/          # React SPA (craco / CRA)
+├── backend/           # FastAPI + SQLAlchemy
+├── scanner/           # Standalone scanner worker entry
+├── browser-worker/    # Playwright validation worker entry
+├── test-target/       # Deliberately vulnerable Flask app
+├── tests/             # pytest suite (no network required)
+├── docker-compose.yml
+├── .env.example
+└── README.md
+```
+
+## Configuration
+
+Everything is driven by `.env` (see `.env.example`). Highlights:
+
+| Var                       | Purpose                                             |
+|---------------------------|-----------------------------------------------------|
+| `DATABASE_URL`            | SQLAlchemy URL (Postgres in compose, SQLite in dev) |
+| `SECRET_KEY`              | JWT signing key                                     |
+| `ADMIN_EMAIL/ADMIN_PASSWORD` | Bootstrap admin created on first run             |
+| `SCANNER_MAX_URLS/DEPTH`  | Crawler bounds                                      |
+| `BROWSER_HEADLESS`        | Toggle Playwright headless mode                     |
+| `REACT_APP_BACKEND_URL`   | Backend URL baked into the frontend build           |
+
+**Never commit `.env` — only `.env.example`.**
+
+## Data & artifacts
+
+The `./data/` directory (bind-mounted into the backend container) holds scan
+artifacts. Findings and scans are also stored in Postgres; export them any time:
+
+```
+GET /api/scans/{id}/export?format=json
+GET /api/scans/{id}/export?format=csv
+GET /api/scans/{id}/export?format=md
+```
+
+## Development
+
+You can run backend + tests without Docker:
+
+```bash
+cd backend
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.docker.txt
+uvicorn server:app --reload
+```
+
+Run the test suite:
+
+```bash
+cd tests
+PYTHONPATH=../backend pytest -q
+```
+
+## Security notes
+
+- The included `test-target` is deliberately vulnerable — **never expose it publicly**.
+- Scanner respects `allowed_domains` and `excluded_paths` on every request.
+- Change the admin password before use.
+
+## Production portability
+
+The application is architecturally identical whether you run it on a laptop, a VPS,
+a private cloud, or another container platform — all configuration comes from
+environment variables. No Emergent-only services are used at runtime.

@@ -1,0 +1,85 @@
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-xss}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-xsspwd}
+      POSTGRES_DB: ${POSTGRES_DB:-xsshunter}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-xss}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-xss}:${POSTGRES_PASSWORD:-xsspwd}@db:5432/${POSTGRES_DB:-xsshunter}
+      SECRET_KEY: ${SECRET_KEY:-please-change-me}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@local.dev}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin123}
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
+      RUN_EMBEDDED_WORKER: "false"
+    ports:
+      - "${BACKEND_PORT:-8001}:8001"
+    volumes:
+      - ./data:/app/data
+
+  scanner:
+    build:
+      context: .
+      dockerfile: scanner/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-xss}:${POSTGRES_PASSWORD:-xsspwd}@db:5432/${POSTGRES_DB:-xsshunter}
+      SCANNER_POLL_INTERVAL: ${SCANNER_POLL_INTERVAL:-2}
+      SCANNER_MAX_CONCURRENCY: ${SCANNER_MAX_CONCURRENCY:-5}
+
+  browser-worker:
+    build:
+      context: .
+      dockerfile: browser-worker/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-xss}:${POSTGRES_PASSWORD:-xsspwd}@db:5432/${POSTGRES_DB:-xsshunter}
+      BROWSER_HEADLESS: ${BROWSER_HEADLESS:-true}
+      BROWSER_TIMEOUT: ${BROWSER_TIMEOUT:-15000}
+
+  frontend:
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
+      args:
+        REACT_APP_BACKEND_URL: ${REACT_APP_BACKEND_URL:-http://localhost:8001}
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "${APP_PORT:-3000}:80"
+
+  test-target:
+    build:
+      context: ./test-target
+    restart: unless-stopped
+    ports:
+      - "${TEST_TARGET_PORT:-5001}:5000"
+
+volumes:
+  db-data:
