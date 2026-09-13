@@ -8,7 +8,9 @@ import re
 import html
 from dataclasses import dataclass, field
 from typing import Iterable, List, Set, Tuple
-from urllib.parse import urlparse, urljoin, urlsplit, urlunsplit, parse_qsl, urlencode, urldefrag
+from urllib.parse import (
+    urlparse, urljoin, urlsplit, urlunsplit, parse_qsl, urlencode, urldefrag, quote,
+)
 
 from bs4 import BeautifulSoup
 
@@ -360,6 +362,106 @@ def apply_baseline_and_header_context(
 
     # Rule 4: everything else unchanged.
     return context, reflected
+
+
+# ---------- Injection locations (beyond query/form params) ----------
+#
+# A single scan probes several injection LOCATIONS per discovered URL. Query
+# and form-body parameters keep their bare name as the Finding.param value
+# (unchanged, backwards compatible). The additional locations added for
+# reflected-XSS coverage are encoded into Finding.param with a "<kind>:<name>"
+# prefix so the value stays human-readable, keeps per-(url,method,param,context)
+# dedup working with no schema change, and lets the browser validator rebuild
+# the exact request that produced the reflection.
+
+HEADER_LOCATION = "header"
+COOKIE_LOCATION = "cookie"
+PATH_LOCATION = "path"
+QUERY_LOCATION = "query"
+
+# Marker used inside the param label for a path-segment injection. The value is
+# appended as a trailing path segment, so there is a single well-known label.
+PATH_PARAM = f"{PATH_LOCATION}:append"
+
+# Request headers most commonly reflected into responses (error pages,
+# "you came from" banners, analytics debug output, virtual-host routing, ...).
+# Case is preserved as sent. User-Agent is included because many apps echo it.
+DEFAULT_FUZZ_HEADERS: List[str] = [
+    "Referer",
+    "User-Agent",
+    "X-Forwarded-For",
+    "X-Forwarded-Host",
+    "X-Forwarded-Proto",
+]
+
+
+def header_param_label(name: str) -> str:
+    return f"{HEADER_LOCATION}:{name}"
+
+
+def cookie_param_label(name: str) -> str:
+    return f"{COOKIE_LOCATION}:{name}"
+
+
+def decode_injection_location(param: str) -> Tuple[str, str]:
+    """Return ``(kind, name)`` for a Finding.param value.
+
+    ``kind`` is one of ``header`` / ``cookie`` / ``path`` / ``query``. Bare
+    names (no recognised prefix) decode to ``("query", name)`` — this is the
+    established convention for query/form params and keeps old findings working.
+    """
+    if not param:
+        return QUERY_LOCATION, param
+    for kind in (HEADER_LOCATION, COOKIE_LOCATION, PATH_LOCATION):
+        prefix = kind + ":"
+        if param.startswith(prefix):
+            return kind, param[len(prefix):]
+    return QUERY_LOCATION, param
+
+
+def resolve_fuzz_headers(names: Iterable[str] | None) -> List[str]:
+    """Normalise a configured header-name list, falling back to the defaults.
+
+    Blank / whitespace-only entries are dropped; duplicates (case-insensitive)
+    are collapsed while preserving first-seen order.
+    """
+    source = list(names) if names else list(DEFAULT_FUZZ_HEADERS)
+    out: List[str] = []
+    seen: Set[str] = set()
+    for n in source:
+        n = (n or "").strip()
+        if not n or n.lower() in seen:
+            continue
+        seen.add(n.lower())
+        out.append(n)
+    return out
+
+
+def normalize_cookie_names(names: Iterable[str] | None) -> List[str]:
+    """Normalise a configured cookie-name list (blanks dropped, deduped)."""
+    out: List[str] = []
+    seen: Set[str] = set()
+    for n in list(names or []):
+        n = (n or "").strip()
+        if not n or n in seen:
+            continue
+        seen.add(n)
+        out.append(n)
+    return out
+
+
+def inject_path_marker(url: str, value: str) -> str:
+    """Return ``url`` with ``value`` appended as a trailing path segment.
+
+    Query and fragment are preserved. ``value`` is percent-encoded so the
+    resulting string is a valid URL. Used both for the marker probe and for the
+    per-URL path baseline (with a neutral placeholder value).
+    """
+    parts = urlsplit(url)
+    path = parts.path or "/"
+    seg = quote(value, safe="")
+    newpath = path + seg if path.endswith("/") else path + "/" + seg
+    return urlunsplit((parts.scheme, parts.netloc, newpath, parts.query, ""))
 
 
 # ---------- Payload building ----------

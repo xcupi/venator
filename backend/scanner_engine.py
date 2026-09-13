@@ -30,15 +30,21 @@ from models import Scan, Project, DiscoveredURL, Candidate, Finding, AuthProfile
 from scanner_core import (
     DEFAULT_MARKER,
     ENCODED_PROBE,
+    PATH_PARAM,
     apply_baseline_and_header_context,
     classify_context,
     classify_finding,
+    cookie_param_label,
     extract_csrf_values,
     extract_get_params,
     extract_links_and_forms,
     guess_severity,
+    header_param_label,
     in_scope,
+    inject_path_marker,
+    normalize_cookie_names,
     normalize_url,
+    resolve_fuzz_headers,
 )
 from auth_http import build_auth, looks_like_auth_loss, should_attach_auth
 
@@ -229,8 +235,15 @@ async def _read_bounded(resp: aiohttp.ClientResponse, limit: int) -> Tuple[str, 
 async def _fetch(session: aiohttp.ClientSession, method: str, url: str,
                  params=None, data=None, timeout: int = 15,
                  auth_headers=None, auth_cookies=None, allowed_domains=None,
-                 limiter: Optional[RequestLimiter] = None):
+                 limiter: Optional[RequestLimiter] = None,
+                 inject_headers=None, inject_cookies=None):
     """Scope-safe HTTP fetch. Never attaches auth to out-of-scope hosts.
+
+    ``inject_headers`` / ``inject_cookies`` carry the reflection marker into a
+    request header or cookie (the new header/cookie injection locations). They
+    are applied FIRST; configured auth material is layered on top so auth always
+    wins a name collision and the authenticated session is never broken by a
+    probe. Injected material rides only on the (in-scope) probe request.
 
     Every request passes through the per-authority limiter (scan-scoped, or the
     per-loop default outside scan context): acquire a concurrency slot, pace the
@@ -248,13 +261,13 @@ async def _fetch(session: aiohttp.ClientSession, method: str, url: str,
     final response — list form preserves multi-value headers such as
     ``Set-Cookie``. On transport errors returns ``(0, "", str(exc), False, [])``.
     """
-    hdrs = {}
-    cookies = None
+    hdrs = dict(inject_headers or {})
+    cookies = dict(inject_cookies) if inject_cookies else None
     if auth_headers or auth_cookies:
         if allowed_domains and should_attach_auth(url, allowed_domains):
             hdrs.update(auth_headers or {})
             if auth_cookies:
-                cookies = dict(auth_cookies)
+                cookies = {**(cookies or {}), **dict(auth_cookies)}
     throttle = (limiter or _get_default_limiter()).for_url(url)
     await throttle.acquire()
     try:
@@ -408,6 +421,90 @@ async def _probe_get(
         q2 = {**other, pname: ENCODED_PROBE}
         _, eb, _, et, _ = await _fetch(
             session, "GET", base_url, params=q2, timeout=timeout,
+            auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
+            limiter=limiter,
+        )
+        out.encoded_body, out.encoded_truncated = eb, et
+    return out
+
+
+async def _probe_header(
+    session: aiohttp.ClientSession, url: str, header_name: str, inj: str, marker: str,
+    auth_headers: dict, auth_cookies: dict, allowed: list,
+    timeout: int, limiter: Optional["RequestLimiter"],
+) -> _ProbeOutcome:
+    """Header-injection probe: send the marker in a single request header and
+    look for it reflected in the response body. The discovered URL (query
+    intact) is requested unchanged; only the header carries the payload."""
+    status, body, _, truncated, resp_headers = await _fetch(
+        session, "GET", url, timeout=timeout,
+        auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
+        limiter=limiter, inject_headers={header_name: inj},
+    )
+    out = _ProbeOutcome(
+        status=status, body=body, truncated=truncated,
+        req_dump=f"GET {url}\n{header_name}: {inj}",
+        headers=resp_headers,
+    )
+    if _should_probe_encoding(body, marker):
+        _, eb, _, et, _ = await _fetch(
+            session, "GET", url, timeout=timeout,
+            auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
+            limiter=limiter, inject_headers={header_name: ENCODED_PROBE},
+        )
+        out.encoded_body, out.encoded_truncated = eb, et
+    return out
+
+
+async def _probe_cookie(
+    session: aiohttp.ClientSession, url: str, cookie_name: str, inj: str, marker: str,
+    auth_headers: dict, auth_cookies: dict, allowed: list,
+    timeout: int, limiter: Optional["RequestLimiter"],
+) -> _ProbeOutcome:
+    """Cookie-injection probe: send the marker as a single request cookie and
+    look for it reflected in the response body."""
+    status, body, _, truncated, resp_headers = await _fetch(
+        session, "GET", url, timeout=timeout,
+        auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
+        limiter=limiter, inject_cookies={cookie_name: inj},
+    )
+    out = _ProbeOutcome(
+        status=status, body=body, truncated=truncated,
+        req_dump=f"GET {url}\nCookie: {cookie_name}={inj}",
+        headers=resp_headers,
+    )
+    if _should_probe_encoding(body, marker):
+        _, eb, _, et, _ = await _fetch(
+            session, "GET", url, timeout=timeout,
+            auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
+            limiter=limiter, inject_cookies={cookie_name: ENCODED_PROBE},
+        )
+        out.encoded_body, out.encoded_truncated = eb, et
+    return out
+
+
+async def _probe_path(
+    session: aiohttp.ClientSession, url: str, inj: str, marker: str,
+    auth_headers: dict, auth_cookies: dict, allowed: list,
+    timeout: int, limiter: Optional["RequestLimiter"],
+) -> _ProbeOutcome:
+    """Path-segment injection probe: append the marker as a trailing path
+    segment and look for it reflected in the response body (breadcrumbs, 404
+    pages, "page not found: <path>" messages, ...)."""
+    probe_url = inject_path_marker(url, inj)
+    status, body, _, truncated, resp_headers = await _fetch(
+        session, "GET", probe_url, timeout=timeout,
+        auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
+        limiter=limiter,
+    )
+    out = _ProbeOutcome(
+        status=status, body=body, truncated=truncated,
+        req_dump=f"GET {probe_url}",
+        headers=resp_headers,
+    )
+    if _should_probe_encoding(body, marker):
+        _, eb, _, et, _ = await _fetch(
+            session, "GET", inject_path_marker(url, ENCODED_PROBE), timeout=timeout,
             auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
             limiter=limiter,
         )
@@ -574,6 +671,54 @@ def _record_probe_result(scan_id: str, url: str, method: str, pname: str,
             db.commit()
 
 
+def _finalize_probe(scan_id: str, url: str, method: str, param_label: str, marker: str,
+                    outcome: "_ProbeOutcome",
+                    baseline_body, baseline_headers,
+                    auth_headers: dict, auth_cookies: dict, login_indicators: list) -> None:
+    """Shared post-probe pipeline: classify → baseline/header guard → encoded
+    demote → record. Used identically by the query, header, cookie and path
+    probes so every injection location gets the same false-positive suppression
+    and encoding checks.
+
+    Transport errors (status 0) are ignored. Auth loss on the probe raises
+    AuthLostError so the caller escalates. ``param_label`` is the value stored
+    on the Finding (bare name for query/form params, ``<kind>:<name>`` for the
+    header/cookie/path locations).
+    """
+    if outcome.status == 0:
+        return
+    if (auth_headers or auth_cookies) and looks_like_auth_loss(
+            outcome.status, outcome.body, login_indicators):
+        raise AuthLostError(
+            f"Authentication lost while testing {url} (param {param_label}, status {outcome.status})"
+        )
+
+    context = classify_context(outcome.body, marker)
+    reflected = context != "none"
+    if outcome.truncated and not reflected:
+        log.warning(
+            "response truncated at %d bytes before marker could be observed: %s %s param=%s",
+            MAX_BODY_BYTES, method, url, param_label,
+        )
+        context = "unknown"
+
+    context, reflected = apply_baseline_and_header_context(
+        context, reflected, outcome.truncated, marker,
+        outcome.headers, baseline_body, baseline_headers,
+    )
+
+    if reflected and context in ("html", "attribute"):
+        if (outcome.encoded_body and not outcome.encoded_truncated
+                and ENCODED_PROBE not in outcome.encoded_body
+                and ("&lt;" in outcome.encoded_body or "&gt;" in outcome.encoded_body)):
+            context = "encoded"
+
+    _record_probe_result(
+        scan_id, url, method, param_label, context, reflected,
+        marker, outcome.body, outcome.req_dump,
+    )
+
+
 async def _fetch_baseline_get(
     session: aiohttp.ClientSession, base_url: str, all_query_params: list,
     auth_headers: dict, auth_cookies: dict, allowed: list,
@@ -622,6 +767,85 @@ async def _fetch_baseline_post(
     if status == 0:
         return None, []
     return body, resp_headers
+
+
+async def _probe_extra_get_locations(
+    session: aiohttp.ClientSession, scan_id: str, url: str, marker: str, cfg: dict,
+    baseline_body, baseline_headers,
+    auth_headers: dict, auth_cookies: dict, allowed: list, login_indicators: list,
+    timeout: int, limiter: Optional["RequestLimiter"],
+) -> None:
+    """Probe the header / cookie / path injection locations for one GET URL.
+
+    Config keys (all optional, read from the scan config). All default to OFF
+    at the engine level so a config that predates this feature (and the test
+    harness) behaves exactly as before; the API layer opts new scans in via
+    :class:`server.ScanIn` (headers on by default there):
+      - ``fuzz_headers`` (bool) + ``fuzz_header_names`` (list, default
+        :data:`scanner_core.DEFAULT_FUZZ_HEADERS`).
+      - ``fuzz_cookies`` (bool) + ``fuzz_cookie_names`` (list). No default
+        cookie names — arbitrary cookie names are meaningless, so cookie
+        fuzzing is a no-op until the operator names cookies to try.
+      - ``fuzz_path`` (bool).
+
+    Header/cookie names that collide with configured auth material are skipped:
+    the auth value would overwrite the probe (see :func:`_fetch`), so probing
+    them is pointless and must never risk clobbering the authenticated session.
+    """
+    inj = f"pre_{marker}_post"
+
+    if cfg.get("fuzz_headers", False):
+        auth_header_names = {k.lower() for k in (auth_headers or {})}
+        for header_name in resolve_fuzz_headers(cfg.get("fuzz_header_names")):
+            if header_name.lower() in auth_header_names:
+                continue
+            outcome = await _probe_header(
+                session, url, header_name, inj, marker,
+                auth_headers, auth_cookies, allowed, timeout, limiter,
+            )
+            _finalize_probe(
+                scan_id, url, "GET", header_param_label(header_name), marker, outcome,
+                baseline_body, baseline_headers,
+                auth_headers, auth_cookies, login_indicators,
+            )
+
+    if cfg.get("fuzz_cookies", False):
+        auth_cookie_names = set(auth_cookies or {})
+        for cookie_name in normalize_cookie_names(cfg.get("fuzz_cookie_names")):
+            if cookie_name in auth_cookie_names:
+                continue
+            outcome = await _probe_cookie(
+                session, url, cookie_name, inj, marker,
+                auth_headers, auth_cookies, allowed, timeout, limiter,
+            )
+            _finalize_probe(
+                scan_id, url, "GET", cookie_param_label(cookie_name), marker, outcome,
+                baseline_body, baseline_headers,
+                auth_headers, auth_cookies, login_indicators,
+            )
+
+    if cfg.get("fuzz_path", False):
+        # Dedicated baseline: the path probe targets a DIFFERENT URL (extra
+        # trailing segment), so the URL's query baseline cannot detect its
+        # pollution. One extra request per URL, only when path fuzzing is on.
+        path_baseline_body = None
+        path_baseline_headers: list = []
+        status, pbody, _, _, pheaders = await _fetch(
+            session, "GET", inject_path_marker(url, BASELINE_PLACEHOLDER), timeout=timeout,
+            auth_headers=auth_headers, auth_cookies=auth_cookies, allowed_domains=allowed,
+            limiter=limiter,
+        )
+        if status != 0:
+            path_baseline_body, path_baseline_headers = pbody, pheaders
+        outcome = await _probe_path(
+            session, url, inj, marker,
+            auth_headers, auth_cookies, allowed, timeout, limiter,
+        )
+        _finalize_probe(
+            scan_id, url, "GET", PATH_PARAM, marker, outcome,
+            path_baseline_body, path_baseline_headers,
+            auth_headers, auth_cookies, login_indicators,
+        )
 
 
 async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
@@ -744,57 +968,26 @@ async def _test_reflection(scan_id: str, cfg: dict, allowed: list,
                     )
                     continue
 
-                # Transport error: do not record; move on.
-                if outcome.status == 0:
-                    continue
-
-                # Auth-loss on the primary probe → escalate.
-                if (auth_headers or auth_cookies) and looks_like_auth_loss(
-                        outcome.status, outcome.body, login_indicators):
-                    raise AuthLostError(
-                        f"Authentication lost while testing {url} (status {outcome.status})"
-                    )
-
-                context = classify_context(outcome.body, marker)
-                reflected = context != "none"
-                if outcome.truncated and not reflected:
-                    # Body was cut at MAX_BODY_BYTES before the marker could be
-                    # observed — reflection state is UNKNOWN. Preserve pre-
-                    # refactor behaviour: record a Candidate with context
-                    # 'unknown' and DO NOT create a Finding (reflected stays
-                    # False).
-                    log.warning(
-                        "response truncated at %d bytes before marker could be observed: %s %s param=%s",
-                        MAX_BODY_BYTES, method, url, pname,
-                    )
-                    context = "unknown"
-
-                # Baseline diff + header-reflection guard. Pure function; may
-                # downgrade a body reflection to ("none", False) when the
-                # baseline already contained the marker (→ false_positive) or
-                # promote a header-only reflection to ("header", True)
-                # (→ reflection_only). Truncated results (context=="unknown")
-                # are passed through unchanged — see rule 1 of the helper.
-                context, reflected = apply_baseline_and_header_context(
-                    context, reflected, outcome.truncated, marker,
-                    outcome.headers, baseline_body, baseline_headers,
+                # Classify → baseline/header guard → encoded demote → record.
+                _finalize_probe(
+                    scan_id, url, method, pname, marker, outcome,
+                    baseline_body, baseline_headers,
+                    auth_headers, auth_cookies, login_indicators,
                 )
 
-                # Demote html/attribute reflections to 'encoded' when the
-                # encoded probe proves the target HTML-escapes the input.
-                # A truncated probe response cannot prove safe encoding —
-                # "probe not found" in a cut body may just mean the reflection
-                # lies beyond the retained prefix, so the demotion requires
-                # the FULL body.
-                if reflected and context in ("html", "attribute"):
-                    if (outcome.encoded_body and not outcome.encoded_truncated
-                            and ENCODED_PROBE not in outcome.encoded_body
-                            and ("&lt;" in outcome.encoded_body or "&gt;" in outcome.encoded_body)):
-                        context = "encoded"
-
-                _record_probe_result(
-                    scan_id, url, method, pname, context, reflected,
-                    marker, outcome.body, outcome.req_dump,
+            # Additional injection LOCATIONS for GET URLs: request headers,
+            # request cookies and path segments. These reuse the URL's GET
+            # baseline (body/headers with no injected header/cookie) for the
+            # same false-positive suppression; the path probe gets its own
+            # baseline because it targets a different URL. Skipped for POST
+            # targets (headers/cookies would need per-endpoint request shaping
+            # and are covered by the GET pass on the same host).
+            if method == "GET":
+                await _probe_extra_get_locations(
+                    session, scan_id, url, marker, cfg,
+                    baseline_body, baseline_headers,
+                    auth_headers, auth_cookies, allowed, login_indicators,
+                    timeout, limiter,
                 )
 
 

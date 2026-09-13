@@ -18,7 +18,10 @@ export default function Scans() {
   const [projects, setProjects] = useState([]);
   const [scans, setScans] = useState([]);
   const [authProfiles, setAuthProfiles] = useState([]);
-  const [form, setForm] = useState({ project_id: "", target_url: "", max_urls: 100, max_depth: 3, auth_profile_id: "" });
+  const [form, setForm] = useState({
+    project_id: "", target_url: "", max_urls: 100, max_depth: 3, auth_profile_id: "",
+    fuzz_headers: true, fuzz_cookies: false, fuzz_cookie_names: "", fuzz_path: false,
+  });
 
   const load = async () => {
     const [p, s, a] = await Promise.all([api.get("/projects"), api.get("/scans"), api.get("/auth-profiles")]);
@@ -41,6 +44,12 @@ export default function Scans() {
       max_urls: Number(form.max_urls),
       max_depth: Number(form.max_depth),
       auth_profile_id: form.auth_profile_id || null,
+      fuzz_headers: form.fuzz_headers,
+      fuzz_cookies: form.fuzz_cookies,
+      fuzz_cookie_names: form.fuzz_cookie_names
+        ? form.fuzz_cookie_names.split(",").map((c) => c.trim()).filter(Boolean)
+        : null,
+      fuzz_path: form.fuzz_path,
     });
     setForm({ ...form, target_url: "" });
     load();
@@ -94,6 +103,42 @@ export default function Scans() {
         <button data-testid="start-scan-btn" className="bg-emerald-500 hover:bg-emerald-400 text-zinc-900 font-semibold rounded px-3 py-2 text-sm flex items-center justify-center gap-2">
           <Play size={14} /> Queue scan
         </button>
+        <div className="md:col-span-4 flex flex-wrap items-center gap-4 text-xs text-zinc-400">
+          <span className="text-zinc-500">Injection points:</span>
+          <label className="flex items-center gap-1.5">
+            <input
+              data-testid="scan-fuzz-headers" type="checkbox"
+              checked={form.fuzz_headers}
+              onChange={(e) => setForm({ ...form, fuzz_headers: e.target.checked })}
+            />
+            Request headers
+          </label>
+          <label className="flex items-center gap-1.5">
+            <input
+              data-testid="scan-fuzz-path" type="checkbox"
+              checked={form.fuzz_path}
+              onChange={(e) => setForm({ ...form, fuzz_path: e.target.checked })}
+            />
+            URL path
+          </label>
+          <label className="flex items-center gap-1.5">
+            <input
+              data-testid="scan-fuzz-cookies" type="checkbox"
+              checked={form.fuzz_cookies}
+              onChange={(e) => setForm({ ...form, fuzz_cookies: e.target.checked })}
+            />
+            Cookies
+          </label>
+          {form.fuzz_cookies && (
+            <input
+              data-testid="scan-fuzz-cookie-names"
+              placeholder="cookie names (comma-separated)"
+              className="flex-1 min-w-[200px] bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-xs"
+              value={form.fuzz_cookie_names}
+              onChange={(e) => setForm({ ...form, fuzz_cookie_names: e.target.value })}
+            />
+          )}
+        </div>
       </form>
 
       <div className="border border-zinc-800 rounded-lg bg-zinc-900/40 overflow-hidden">

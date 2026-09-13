@@ -117,6 +117,13 @@ class ScanIn(BaseModel):
     max_depth: int = 3
     request_timeout: int = 15
     auth_profile_id: Optional[str] = None
+    # Injection-location coverage (reflected-XSS). Query/form params are always
+    # probed; these toggle the additional request locations.
+    fuzz_headers: bool = True
+    fuzz_header_names: Optional[List[str]] = None
+    fuzz_cookies: bool = False
+    fuzz_cookie_names: Optional[List[str]] = None
+    fuzz_path: bool = False
 
 
 class ScanOut(BaseModel):
@@ -456,7 +463,16 @@ def create_scan(body: ScanIn, user: User = Depends(current_user), db: Session = 
     s = Scan(
         project_id=body.project_id, auth_profile_id=body.auth_profile_id,
         target_url=body.target_url, status="QUEUED",
-        config={"max_urls": body.max_urls, "max_depth": body.max_depth, "request_timeout": body.request_timeout},
+        config={
+            "max_urls": body.max_urls,
+            "max_depth": body.max_depth,
+            "request_timeout": body.request_timeout,
+            "fuzz_headers": body.fuzz_headers,
+            "fuzz_header_names": body.fuzz_header_names,
+            "fuzz_cookies": body.fuzz_cookies,
+            "fuzz_cookie_names": body.fuzz_cookie_names,
+            "fuzz_path": body.fuzz_path,
+        },
         stats={},
     )
     db.add(s); db.commit(); db.refresh(s)
